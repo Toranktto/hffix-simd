@@ -1,47 +1,254 @@
-name: hffix test
+name: hffix2 ci
 
-# Controls when the action will run. Triggers the workflow on push
 on:
   push:
     branches:
       - master
   pull_request:
-  # release:
-    # tags:
-    # - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
 
 jobs:
+  format:
+    runs-on: ubuntu-latest
+    name: clang-format check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install clang-format (pinned)
+        run: pip install 'clang-format>=20,<21'
+      - name: Run format-check.sh
+        run: scripts/format-check.sh
+
   test:
-    runs-on:
-      - ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        compiler:
-        - cxx: "g++"
-        # https://stackoverflow.com/questions/76859275/error-compiling-a-cpp-containing-stdchrono-errorstatic-constexpr-unsigned-fra
-        - cxx: "clang++ -stdlib=libc++"
-        flags:
-        - cxxflags: "-std=c++98"
-        - cxxflags: "-std=c++11"
-        - cxxflags: "-std=c++17"
-        - cxxflags: "-std=c++20"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Install Boost
-        uses: MarkusJx/install-boost@v2.4.5
-        id:   install-boost
-        with:
-          boost_version: 1.83.0
-      - name: Test
-        # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+            cxx: g++
+            conan_extra: ""
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+            conan_extra: ""
+          - os: macos-latest
+            compiler: apple-clang
+            cc: clang
+            cxx: clang++
+            conan_extra: ""
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+            cxx: cl
+            conan_extra: ""
+          - os: windows-latest
+            compiler: clang-cl
+            cc: clang-cl
+            cxx: clang-cl
+            conan_extra: "-s:h compiler=msvc -s:h compiler.version=194 -s:h compiler.runtime=dynamic -s:b compiler=msvc -s:b compiler.version=194 -s:b compiler.runtime=dynamic"
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    defaults:
+      run:
         shell: bash
-        env:
-          CPLUS_INCLUDE_PATH: ${{steps.install-boost.outputs.BOOST_ROOT}}/include
-          LIBRARY_PATH: ${{steps.install-boost.outputs.BOOST_ROOT}}/lib
-          CXX: ${{matrix.compiler.cxx}}
-          CXXFLAGS: ${{matrix.flags.cxxflags}}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Conan
         run: |
-           $CXX --version
-           make test
+          pip install --upgrade pip
+          pip install 'conan>=2.0,<3.0'
+          conan --version
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan2-${{ matrix.os }}-${{ matrix.compiler }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: |
+            conan2-${{ matrix.os }}-${{ matrix.compiler }}-
+
+      - name: Detect Conan profile
+        run: conan profile detect --force
+
+      - name: Conan install
+        run: |
+          conan install . \
+            --output-folder=build \
+            --build=missing \
+            -s build_type=Release \
+            -s compiler.cppstd=20 \
+            -s:b compiler.cppstd=20 \
+            -c tools.cmake.cmaketoolchain:generator=Ninja \
+            -c:h "tools.build:compiler_executables={\"c\":\"${{ matrix.cc }}\",\"cpp\":\"${{ matrix.cxx }}\"}" \
+            ${{ matrix.conan_extra }}
+
+      - name: CMake configure
+        run: cmake --preset conan-release
+
+      - name: CMake build
+        run: cmake --build build --config Release --parallel
+
+      - name: ctest
+        run: ctest --test-dir build --build-config Release --output-on-failure --parallel 4
+
+  sanitizers:
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+          - { name: asan, flag: HFFIX_SANITIZE,        opts: "ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1" }
+          - { name: tsan, flag: HFFIX_SANITIZE_THREAD, opts: "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1" }
+    runs-on: ubuntu-latest
+    name: ubuntu / clang / ${{ matrix.sanitizer.name }}
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Conan + tools
+        run: |
+          pip install --upgrade pip
+          pip install 'conan>=2.0,<3.0'
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan2-${{ matrix.sanitizer.name }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: |
+            conan2-${{ matrix.sanitizer.name }}-
+
+      - name: Detect Conan profile
+        run: conan profile detect --force
+
+      - name: Conan install (Debug, no LTO)
+        run: |
+          conan install . \
+            --output-folder=build-${{ matrix.sanitizer.name }} \
+            --build=missing \
+            -s build_type=Debug \
+            -s compiler.cppstd=20 \
+            -s:b compiler.cppstd=20 \
+            -c tools.cmake.cmaketoolchain:generator=Ninja \
+            -c 'tools.build:compiler_executables={"c":"clang","cpp":"clang++"}'
+
+      - name: CMake configure
+        run: |
+          cmake --preset conan-debug \
+            -D${{ matrix.sanitizer.flag }}=ON \
+            -DHFFIX_LTO=OFF \
+            -DHFFIX_NATIVE_ARCH=OFF
+
+      - name: CMake build
+        run: cmake --build build-${{ matrix.sanitizer.name }} --parallel
+
+      - name: ctest
+        run: |
+          export ${{ matrix.sanitizer.opts }}
+          ctest --test-dir build-${{ matrix.sanitizer.name }} --output-on-failure --parallel 4
+
+  fuzz:
+    runs-on: ubuntu-latest
+    name: ubuntu / clang / libFuzzer (60s)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang
+      - name: Configure fuzz harness
+        run: |
+          cmake -S fuzz -B build/fuzz -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build fuzz_reader
+        run: cmake --build build/fuzz --target fuzz_reader --parallel
+      - name: Seed corpus
+        run: cmake --build build/fuzz --target fuzz_dataset
+      - name: Run libFuzzer (60s, halt on crash)
+        env:
+          HFFIX_FUZZ_MAX_TIME: 60
+        run: |
+          mkdir -p fuzz-corpus
+          build/fuzz/fuzz_reader \
+            -max_total_time=${HFFIX_FUZZ_MAX_TIME} \
+            -timeout=10 \
+            -rss_limit_mb=2048 \
+            fuzz-corpus build/fuzz/dataset
+      - name: Upload crashes (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+          if-no-files-found: ignore
+
+  docs:
+    runs-on: ubuntu-latest
+    name: ubuntu / doxygen build
+    env:
+      DOXYGEN_VERSION: "1.17.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install graphviz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz
+      - name: Install doxygen (pinned ${{ env.DOXYGEN_VERSION }})
+        run: |
+          set -euo pipefail
+          curl -fsSL -o doxygen.tar.gz \
+            "https://www.doxygen.nl/files/doxygen-${DOXYGEN_VERSION}.linux.bin.tar.gz"
+          tar xf doxygen.tar.gz
+          sudo install -m 0755 "doxygen-${DOXYGEN_VERSION}/bin/doxygen" /usr/local/bin/doxygen
+          doxygen --version
+      - name: Configure
+        run: cmake -S . -B build-docs -DHFFIX_BUILD=OFF -DHFFIX_BUILD_DOCS=ON
+      - name: Build docs
+        run: cmake --build build-docs --target docs 2>&1 | tee doxygen.log
+      - name: Fail on doxygen warnings
+        run: |
+          if grep -E "^[^:]+:[0-9]+: warning:" doxygen.log; then
+            echo "Doxygen produced warnings"; exit 1
+          fi

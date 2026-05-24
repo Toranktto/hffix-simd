@@ -1,0 +1,69 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+
+# Width / indent
+ColumnLimit: 100
+IndentWidth: 4
+ContinuationIndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# Braces — Google style attaches `{` to the previous line everywhere
+# (functions, classes, namespaces, control flow).
+BreakBeforeBraces: Attach
+
+# Pointers / qualifiers — match existing east-const style (char const*).
+PointerAlignment: Left
+ReferenceAlignment: Left
+QualifierAlignment: Right
+
+# Wrapping
+AllowShortFunctionsOnASingleLine: InlineOnly
+AllowShortLambdasOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: None
+AlignConsecutiveDeclarations: None
+AlignTrailingComments: true
+AlwaysBreakTemplateDeclarations: Yes
+BinPackArguments: false
+BinPackParameters: false
+
+# Includes
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+IncludeCategories:
+  - Regex: '^<gtest/'
+    Priority: 1
+  - Regex: '^<benchmark/'
+    Priority: 1
+  - Regex: '^<boost/'
+    Priority: 2
+  - Regex: '^"hffix'
+    Priority: 4
+  - Regex: '^<hffix'
+    Priority: 4
+  - Regex: '^<'
+    Priority: 3
+  - Regex: '.*'
+    Priority: 5
+
+# Misc
+AccessModifierOffset: -4
+NamespaceIndentation: None
+FixNamespaceComments: true
+SeparateDefinitionBlocks: Always
+SpaceBeforeParens: ControlStatements
+SpaceAfterCStyleCast: false
+SpaceAfterTemplateKeyword: true
+SpacesBeforeTrailingComments: 2
+Cpp11BracedListStyle: true
+Standard: c++20
+
+# Loose end
+ReflowComments: false
+PenaltyBreakComment: 200
+PenaltyExcessCharacter: 10

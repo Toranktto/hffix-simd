@@ -1,5 +1,6 @@
 /*******************************************************************************************
 Copyright 2011, T3 IP, LLC. All rights reserved.
+Copyright 2026, Łukasz Derlatka (modifications). All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification, are
 permitted provided that the following conditions are met:
@@ -11,7 +12,7 @@ permitted provided that the following conditions are met:
       of conditions and the following disclaimer in the documentation and/or other materials
       provided with the distribution.
 
-THIS SOFTWARE IS PROVIDED BY T3 IP, LLC ``AS IS'' AND ANY EXPRESS OR IMPLIED
+THIS SOFTWARE IS PROVIDED BY T3 IP, LLC "AS IS" AND ANY EXPRESS OR IMPLIED
 WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
 FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL T3 IP, LLC OR
 CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
@@ -26,99 +27,180 @@ authors and should not be interpreted as representing official policies, either 
 or implied, of T3 IP, LLC.
 *******************************************************************************************/
 
-/*!
+/**
  * \file
  * \brief The High Frequency FIX Parser Library.
- * Repository at http://github.com/jamesdbrock/hffix
  */
 
-#ifndef HFFIX_HPP
-#define HFFIX_HPP
+#pragma once
 
-#include "hffix_fields.hpp" // for field and message tag names and properties. Needed for length_fields[].
-#include <cstring>          // for memcpy
-#include <string>           //
-#include <algorithm>        // for is_tag_a_data_length
-#include <numeric>          // for accumulate
-#include <iostream>         // for operator<<()
-#include <limits>           // for numeric_limits<>::is_signed
-#include <stdexcept>        // for exceptions
-#if __cplusplus >= 201703L
-#include <string_view>      // for push_back_string()
-#endif
-#if __cplusplus >= 201103L
-#include <cstdint>          // for std::uint8_t
+#include <algorithm>    // for is_tag_a_data_length
+#include <atomic>       // for assert_failure_counter
+#include <bit>          // for std::endian
+#include <cstdint>      // for std::uint8_t
+#include <cstring>      // for memcpy
+#include <iostream>     // for operator<<()
+#include <limits>       // for numeric_limits<>::is_signed
+#include <optional>     // for as_epoch_* return type
+#include <span>         // for basic_indexed_message storage view
+#include <string_view>  // for push_back_string()
+// Angle brackets so downstream can override via -I order.
 #include <chrono>
+#include <string>
+#include <hffix_fields.hpp>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define HFFIX_ALWAYS_INLINE inline __attribute__((always_inline))
+#define HFFIX_PREFETCH(p) __builtin_prefetch((p))
+#define HFFIX_HOT __attribute__((hot))
+#elif defined(_MSC_VER)
+#define HFFIX_ALWAYS_INLINE __forceinline
+#define HFFIX_PREFETCH(p) ((void)0)
+#define HFFIX_HOT
+#else
+#define HFFIX_ALWAYS_INLINE inline
+#define HFFIX_PREFETCH(p) ((void)0)
+#define HFFIX_HOT
 #endif
 
-#ifndef HFFIX_NO_BOOST_DATETIME
-#ifdef DATE_TIME_TIME_HPP___ // The header include guard from boost/date_time/time.hpp
-#ifdef DATE_TIME_DATE_HPP___ // The header include guard from boost/date_time/date.hpp
-#define HFFIX_BOOST_DATETIME
-#endif
+#ifndef HFFIX_ASSERT
+#ifdef NDEBUG
+#define HFFIX_ASSERT(cond, msg)                                                                 \
+    do {                                                                                        \
+        if (!(cond)) [[unlikely]]                                                               \
+            ::hffix::details::assert_failure_counter().fetch_add(1, std::memory_order_relaxed); \
+    } while (0)
+#elif defined(__GNUC__) || defined(__clang__)
+#define HFFIX_ASSERT(cond, msg)   \
+    do {                          \
+        if (!(cond)) [[unlikely]] \
+            __builtin_trap();     \
+    } while (0)
+#elif defined(_MSC_VER)
+#define HFFIX_ASSERT(cond, msg)   \
+    do {                          \
+        if (!(cond)) [[unlikely]] \
+            __debugbreak();       \
+    } while (0)
+#else
+#include <cstdlib>
+#define HFFIX_ASSERT(cond, msg)   \
+    do {                          \
+        if (!(cond)) [[unlikely]] \
+            std::abort();         \
+    } while (0)
 #endif
 #endif
 
-/*!
+/**
 \brief Namespace for all types and functions of High Frequency FIX Parser.
 */
 namespace hffix {
+
+namespace details {
+[[nodiscard]] inline std::atomic<std::uint64_t>& assert_failure_counter() noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    return counter;
+}
+}  // namespace details
+
+/** \brief Monotonic count of `HFFIX_ASSERT` failures. */
+[[nodiscard]] inline std::uint64_t assert_failure_count() noexcept {
+    return details::assert_failure_counter().load(std::memory_order_relaxed);
+}
+
+inline void reset_assert_failure_count() noexcept {
+    details::assert_failure_counter().store(0, std::memory_order_relaxed);
+}
+
+template <std::size_t N>
+struct field_index_buffer {
+    static_assert(N > 0 && N <= 16384, "field_index_buffer<N>: N must be in (0, 16384]");
+
+    alignas(32) int tags[N];
+    alignas(32) std::uint64_t pos_len[N];  // (pos << 32) | len
+    static constexpr std::size_t capacity = N;
+};
 
 /* @cond EXCLUDE */
 
 namespace details {
 
-inline void throw_range_error() {
-    throw std::out_of_range("hffix message_writer buffer full");
+HFFIX_ALWAYS_INLINE char const* find_soh(char const* begin, char const* end) {
+    while (begin < end && *begin != '\x01') {
+        ++begin;
+    }
+    return begin;
+}
+
+HFFIX_ALWAYS_INLINE std::size_t find_tag_in_index(int const* tags, std::size_t n, int tag) {
+    for (std::size_t i = 0; i < n; ++i) {
+        if (tags[i] == tag)
+            return i;
+    }
+    return n;
+}
+
+HFFIX_ALWAYS_INLINE std::uint8_t checksum_bytes(char const* begin, char const* end) {
+    std::uint8_t sum = 0;
+    while (begin != end)
+        sum = static_cast<std::uint8_t>(sum + std::uint8_t(*begin++));
+    return sum;
 }
 
 template <std::size_t N>
-std::ptrdiff_t len(char const (&)[N]) { return std::ptrdiff_t(N - 1); }
+std::ptrdiff_t len(char const (&)[N]) {
+    return std::ptrdiff_t(N - 1);
+}
 
-/*
-\brief Internal ascii-to-integer conversion.
+static_assert(std::endian::native == std::endian::little,
+              "hffix SWAR digit parsers assume little-endian byte order.");
 
-Parses ascii and returns a (possibly negative) integer.
+HFFIX_ALWAYS_INLINE std::uint32_t parse_two_digits(char const* p) {
+    return std::uint32_t(p[0] - '0') * 10 + std::uint32_t(p[1] - '0');
+}
 
-\tparam Int_type The type of integer to be returned.
-\param begin Pointer to the beginning of the ascii string.
-\param end Pointer to past-the-end of the ascii string.
-\return The ascii string represented as an integer of type Int_type.
-*/
-template<typename Int_type> Int_type atoi(char const* begin, char const* end)
-{
-    Int_type val(0);
-    bool isnegative(false);
+HFFIX_ALWAYS_INLINE std::uint32_t parse_four_digits(char const* p) {
+    std::uint32_t v;
+    std::memcpy(&v, p, 4);
+    v -= 0x30303030U;
+    v = (v & 0x000f000fU) * 10 + ((v & 0x0f000f00U) >> 8);
+    return (v & 0x000000ffU) * 100 + ((v & 0x00ff0000U) >> 16);
+}
+
+HFFIX_ALWAYS_INLINE std::uint32_t parse_eight_digits(char const* p) {
+    std::uint64_t v;
+    std::memcpy(&v, p, 8);
+    v -= 0x3030303030303030ULL;
+    v = (v & 0x000f000f000f000fULL) * 10 + ((v & 0x0f000f000f000f00ULL) >> 8);
+    v = (v & 0x000000ff000000ffULL) * 100 + ((v & 0x00ff000000ff0000ULL) >> 16);
+    v = (v & 0x000000000000ffffULL) * 10000 + (v >> 32);
+    return static_cast<std::uint32_t>(v);
+}
+
+template <typename Int_type>
+Int_type atoi(char const* begin, char const* end) {
+    using U = typename std::make_unsigned<Int_type>::type;
+    U uval = 0;
+    bool isnegative = false;
 
     if (begin < end && *begin == '-') {
         isnegative = true;
         ++begin;
     }
 
-    for(; begin<end; ++begin) {
-        val *= 10;
-        val += (Int_type)(*begin - '0');
+    for (; begin < end; ++begin) {
+        uval = uval * 10u + static_cast<U>(static_cast<unsigned char>(*begin) - '0');
     }
 
-    return isnegative ? -val : val;
+    return isnegative ? static_cast<Int_type>(U{0} - uval) : static_cast<Int_type>(uval);
 }
 
-
-/*
-\brief Internal ascii-to-unsigned-integer conversion.
-
-Parses ascii and returns an unsigned integer.
-
-\tparam Uint_type The type of unsigned integer to be returned.
-\param begin Pointer to the beginning of the ascii string.
-\param end Pointer to past-the-end of the ascii string.
-\return The ascii string represented as an unsigned integer of type Uint_type.
-*/
-template<typename Uint_type> Uint_type atou(char const* begin, char const* end)
-{
+template <typename Uint_type>
+inline Uint_type atou(char const* begin, char const* end) {
     Uint_type val(0);
 
-    for(; begin<end; ++begin) {
+    for (; begin < end; ++begin) {
         val *= 10u;
         val += (Uint_type)(*begin - '0');
     }
@@ -126,90 +208,10 @@ template<typename Uint_type> Uint_type atou(char const* begin, char const* end)
     return val;
 }
 
-
-/*
-\brief Internal integer-to-ascii conversion.
-
-Writes an integer out as ascii.
-
-\tparam Int_type Type of integer to be converted.
-\param number Value of the integer to be converted.
-\param buffer Pointer to location for the ascii to be written.
-\param end Past-the-end of the buffer, to check for overflow.
-\return Pointer to past-the-end of the ascii that was written.
-*/
-template<typename Int_type> char* itoa(Int_type number, char* buffer, char* end)
-{
-    // Write out the digits in reverse order.
-    bool isnegative(false);
-    if (number < 0) {
-        isnegative = true;
-        number = -number;
-    }
-
-    char*b = buffer;
-    do {
-        if (b >= end) details::throw_range_error();
-        *b++ = '0' + (number % 10);
-        number /= 10;
-    } while(number);
-
-    if (isnegative) {
-        if (b >= end) details::throw_range_error();
-        *b++ = '-';
-    }
-
-    // Reverse the digits in-place.
-    std::reverse(buffer, b);
-
-    return b;
-}
-
-
-/*
-\brief Internal unsigned-integer-to-ascii conversion.
-
-Writes an unsigned integer out as ascii.
-
-\tparam Int_type Type of integer to be converted.
-\param number Value of the integer to be converted.
-\param buffer Pointer to location for the ascii to be written.
-\param end Past-the-end of the buffer, to check for overflow.
-\return Pointer to past-the-end of the ascii that was written.
-*/
-template<typename Uint_type> char* utoa(Uint_type number, char* buffer, char* end)
-{
-    // Write out the digits in reverse order.
-    char*b = buffer;
-    do {
-        if (b >= end) details::throw_range_error();
-        *b++ = '0' + (number % 10);
-        number /= 10;
-    } while(number);
-
-    // Reverse the digits in-place.
-    std::reverse(buffer, b);
-
-    return b;
-}
-
-/*
-\brief Internal ascii-to-decimal conversion.
-
-Converts an ascii string to a decimal float, of the form \htmlonly mantissa&times;10<sup>exponent</sup>\endhtmlonly.
-
-Non-normalized. The exponent will always be less than or equal to zero.
-If the decimal float is an integer, the exponent will be zero.
-
-\tparam Int_type Signed integer type for the mantissa and exponent.
-\param begin Pointer to the beginning of the ascii string.
-\param end Pointer to past-the-end of the ascii string.
-\param mantissa Reference to storage for the mantissa of the decimal float to be returned.
-\param exponent Reference to storage for the exponent of the decimal float to be returned.
-*/
-template<typename Int_type> void atod(char const* begin, char const* end, Int_type& mantissa, Int_type& exponent)
-{
-    Int_type mantissa_ = 0;
+template <typename Int_type>
+void atod(char const* begin, char const* end, Int_type& mantissa, Int_type& exponent) {
+    using U = std::make_unsigned_t<Int_type>;
+    U m = 0;
     Int_type exponent_ = 0;
     bool isdecimal(false);
     bool isnegative(false);
@@ -219,308 +221,333 @@ template<typename Int_type> void atod(char const* begin, char const* end, Int_ty
         ++begin;
     }
 
-    for(; begin < end; ++begin) {
+    for (; begin < end; ++begin) {
         if (*begin == '.') {
             isdecimal = true;
         } else {
-            mantissa_ *= 10;
-            mantissa_ += (*begin - '0');
-            if (isdecimal) --exponent_;
+            m = m * 10u + static_cast<U>(static_cast<unsigned char>(*begin) - '0');
+            if (isdecimal)
+                --exponent_;
         }
     }
 
-    if (isnegative) mantissa_ = -mantissa_;
-    mantissa = mantissa_;
+    mantissa = isnegative ? static_cast<Int_type>(U{0} - m) : static_cast<Int_type>(m);
     exponent = exponent_;
 }
 
-/*
-\brief Internal decimal-to-ascii conversion.
-
-Converts a decimal float of the form \htmlonly mantissa&times;10<sup>exponent</sup>\endhtmlonly to ascii.
-
-Non-normalized. The exponent parameter must be less than or equal to zero.
-
-\tparam Int_type Integer type for the mantissa and exponent.
-\param mantissa The mantissa of the decimal float.
-\param exponent The exponent of the decimal float. Must be less than or equal to zero.
-\param buffer Pointer to location for the ascii to be written.
-\param end Past-the-end of the buffer, to check for overflow.
-\return Pointer to past-the-end of the ascii that was written.
-*/
-template<typename Int_type> char* dtoa(Int_type mantissa, Int_type exponent, char* buffer, char* end)
-{
-    // Write out the digits in reverse order.
-    bool isnegative(false);
-    if (mantissa < 0) {
-        isnegative = true;
-        mantissa = -mantissa;
+template <typename Int_type>
+[[nodiscard]] inline bool try_atoi(char const* begin, char const* end, Int_type& out) noexcept {
+    static_assert(std::numeric_limits<Int_type>::is_signed,
+                  "try_atoi requires a signed Int_type; use try_atou for unsigned.");
+    if (begin == end)
+        return false;
+    bool neg = false;
+    if (*begin == '-') {
+        neg = true;
+        ++begin;
+        if (begin == end)
+            return false;
     }
+    using U = std::make_unsigned_t<Int_type>;
+    constexpr U max_pos = static_cast<U>(std::numeric_limits<Int_type>::max());
+    U const limit = neg ? static_cast<U>(max_pos + U{1}) : max_pos;
+    U val = 0;
+    for (; begin < end; ++begin) {
+        auto const c = static_cast<unsigned char>(*begin);
+        if (c < '0' || c > '9') [[unlikely]]
+            return false;
+        U const d = static_cast<U>(c - '0');
+        if (val > (limit - d) / 10u) [[unlikely]]
+            return false;
+        val = val * 10u + d;
+    }
+    out = neg ? static_cast<Int_type>(U{0} - val) : static_cast<Int_type>(val);
+    return true;
+}
 
-    char*b = buffer;
-    do {
-        if (b >= end) details::throw_range_error();
-        *b++ = '0' + (mantissa % 10);
-        mantissa /= 10;
-        if (++exponent == 0) {
-            if (b >= end) details::throw_range_error();
-            *b++ = '.';
+template <typename Uint_type>
+[[nodiscard]] inline bool try_atou(char const* begin, char const* end, Uint_type& out) noexcept {
+    static_assert(!std::numeric_limits<Uint_type>::is_signed,
+                  "try_atou requires an unsigned Uint_type; use try_atoi for signed.");
+    if (begin == end)
+        return false;
+    constexpr Uint_type max = std::numeric_limits<Uint_type>::max();
+    Uint_type val = 0;
+    for (; begin < end; ++begin) {
+        auto const c = static_cast<unsigned char>(*begin);
+        if (c < '0' || c > '9') [[unlikely]]
+            return false;
+        Uint_type const d = static_cast<Uint_type>(c - '0');
+        if (val > (max - d) / 10u) [[unlikely]]
+            return false;
+        val = val * 10u + d;
+    }
+    out = val;
+    return true;
+}
+
+template <typename Int_type>
+[[nodiscard]] inline bool try_atod(char const* begin,
+                                   char const* end,
+                                   Int_type& mantissa,
+                                   Int_type& exponent) noexcept {
+    static_assert(std::numeric_limits<Int_type>::is_signed,
+                  "try_atod requires a signed Int_type for the mantissa.");
+    if (begin == end)
+        return false;
+    bool neg = false;
+    if (*begin == '-') {
+        neg = true;
+        ++begin;
+        if (begin == end)
+            return false;
+    }
+    using U = std::make_unsigned_t<Int_type>;
+    constexpr U max_pos = static_cast<U>(std::numeric_limits<Int_type>::max());
+    U const limit = neg ? static_cast<U>(max_pos + U{1}) : max_pos;
+    U m = 0;
+    Int_type e = 0;
+    bool seen_dot = false;
+    bool seen_digit = false;
+    for (; begin < end; ++begin) {
+        char const c = *begin;
+        if (c == '.') {
+            if (seen_dot) [[unlikely]]
+                return false;
+            seen_dot = true;
+            continue;
         }
-    } while(mantissa > 0 || exponent < 1);
-
-    if (isnegative) {
-        if (b >= end) details::throw_range_error();
-        *b++ = '-';
+        auto const uc = static_cast<unsigned char>(c);
+        if (uc < '0' || uc > '9') [[unlikely]]
+            return false;
+        seen_digit = true;
+        U const d = static_cast<U>(uc - '0');
+        if (m > (limit - d) / 10u) [[unlikely]]
+            return false;
+        m = m * 10u + d;
+        if (seen_dot)
+            --e;
     }
+    if (!seen_digit) [[unlikely]]
+        return false;
+    mantissa = neg ? static_cast<Int_type>(U{0} - m) : static_cast<Int_type>(m);
+    exponent = e;
+    return true;
+}
 
-    // Reverse the digits in-place.
+// Max ascii chars to print Int_type (digits + sign).
+template <class Int_type>
+inline constexpr std::ptrdiff_t max_ascii_chars = std::numeric_limits<Int_type>::digits10 + 2;
+
+template <typename Uint_type>
+HFFIX_ALWAYS_INLINE char* utoa_unchecked(Uint_type number, char* buffer) noexcept {
+    char* b = buffer;
+    do {
+        *b++ = static_cast<char>('0' + (number % 10));
+        number /= 10;
+    } while (number);
     std::reverse(buffer, b);
-
     return b;
 }
 
-
-/*
-\brief Internal ascii-to-date conversion.
-
-Parses ascii and returns a LocalMktDate or UTCDate.
-
-\param begin Pointer to the beginning of the ascii string.
-\param end Pointer to past-the-end of the ascii string.
-\param[out] year Year.
-\param[out] month Month.
-\param[out] day Day.
-\return True if successful and the out arguments were set.
-*/
-inline bool atodate(
-    char const* begin,
-    char const* end,
-    int& year,
-    int& month,
-    int& day
-)
-{
-    if (end - begin != 8) return false;
-
-    year = details::atoi<int>(begin, begin + 4);
-    month = details::atoi<int>(begin + 4, begin + 6);
-    day = details::atoi<int>(begin + 6, begin + 8);
-
-    return true;
+template <typename Int_type>
+HFFIX_ALWAYS_INLINE char* itoa_unchecked(Int_type number, char* buffer) noexcept {
+    using U = std::make_unsigned_t<Int_type>;
+    bool const isnegative = number < 0;
+    U n = isnegative ? U{0} - static_cast<U>(number) : static_cast<U>(number);
+    char* b = buffer;
+    do {
+        *b++ = static_cast<char>('0' + (n % 10));
+        n /= 10;
+    } while (n);
+    if (isnegative)
+        *b++ = '-';
+    std::reverse(buffer, b);
+    return b;
 }
 
-
-/*
-\brief Internal ascii-to-time conversion with millisecond precision.
-
-Parses ascii and returns a time with millisecond precision.
-
-\param begin Pointer to the beginning of the ascii string.
-\param end Pointer to past-the-end of the ascii string.
-\param[out] hour Hour.
-\param[out] minute Minute.
-\param[out] second Second.
-\param[out] millisecond Millisecond.
-\return True if successful and the out arguments were set.
-*/
-inline bool atotime(
-    char const* begin,
-    char const* end,
-    int& hour,
-    int& minute,
-    int& second,
-    int& millisecond
-)
-{
-    if (end - begin != 8 && end - begin != 12) return false;
-
-    hour = details::atoi<int>(begin, begin + 2);
-    minute = details::atoi<int>(begin + 3, begin + 5);
-    second = details::atoi<int>(begin + 6, begin + 8);
-
-    if (end - begin == 12)
-        millisecond = details::atoi<int>(begin + 9, begin + 12);
-    else
-        millisecond = 0;
-    return true;
+template <typename Int_type>
+HFFIX_ALWAYS_INLINE char* dtoa_unchecked(Int_type mantissa, Int_type exponent, char* buffer) noexcept {
+    using U = std::make_unsigned_t<Int_type>;
+    bool const isnegative = mantissa < 0;
+    U m = isnegative ? U{0} - static_cast<U>(mantissa) : static_cast<U>(mantissa);
+    char* b = buffer;
+    do {
+        *b++ = static_cast<char>('0' + (m % 10));
+        m /= 10;
+        if (++exponent == 0)
+            *b++ = '.';
+    } while (m > 0 || exponent < 1);
+    if (isnegative)
+        *b++ = '-';
+    std::reverse(buffer, b);
+    return b;
 }
 
-/*
-\brief Internal ascii-to-time conversion with nanosecond precision.
+HFFIX_ALWAYS_INLINE void itoa_padded_unchecked(int x, char* b, char* e) noexcept {
+    while (e > b) {
+        *--e = static_cast<char>('0' + (x % 10));
+        x /= 10;
+    }
+}
 
-Parses ascii and returns a time with nanosecond precision.
-
-\param begin Pointer to the beginning of the ascii string.
-\param end Pointer to past-the-end of the ascii string.
-\param[out] hour Hour.
-\param[out] minute Minute.
-\param[out] second Second.
-\param[out] nanosecond Nanosecond.
-\return True if successful and the out arguments were set.
-*/
-inline bool atotime_nano(
-    char const* begin,
-    char const* end,
-    int& hour,
-    int& minute,
-    int& second,
-    int& nanosecond
-)
-{
-    if (end - begin < 8)
+inline bool atodate(char const* begin, char const* end, int& year, int& month, int& day) {
+    if (end - begin != 8)
         return false;
+    std::uint32_t yyyymmdd = details::parse_eight_digits(begin);
+    year = static_cast<int>(yyyymmdd / 10000U);
+    month = static_cast<int>((yyyymmdd / 100U) % 100U);
+    day = static_cast<int>(yyyymmdd % 100U);
+    return true;
+}
 
-    hour = details::atoi<int>(begin, begin + 2);
-    minute = details::atoi<int>(begin + 3, begin + 5);
-    second = details::atoi<int>(begin + 6, begin + 8);
-
-    switch (end - begin) {
-    case 12: nanosecond = details::atoi<int>(begin + 9, begin + 12) * 1000000L; break;
-    case 15: nanosecond = details::atoi<int>(begin + 9, begin + 15) * 1000L; break;
-    case 18: nanosecond = details::atoi<int>(begin + 9, begin + 18); break;
-    default: nanosecond = 0;
+inline bool atotime(
+    char const* begin, char const* end, int& hour, int& minute, int& second, int& millisecond) {
+    if (end - begin != 8 && end - begin != 12)
+        return false;
+    hour = static_cast<int>(details::parse_two_digits(begin));
+    minute = static_cast<int>(details::parse_two_digits(begin + 3));
+    second = static_cast<int>(details::parse_two_digits(begin + 6));
+    if (end - begin == 12) {
+        millisecond = static_cast<int>(details::parse_two_digits(begin + 9)) * 10 +
+                      static_cast<int>(begin[11] - '0');
+    } else {
+        millisecond = 0;
     }
     return true;
 }
 
-#if __cplusplus >= 201103L
-/*
-\brief SFINAE to check if type is std::chrono::time_point
+inline bool atotime_nano(
+    char const* begin, char const* end, int& hour, int& minute, int& second, int& nanosecond) {
+    if (end - begin < 8)
+        return false;
 
-\tparam Clock the clock on which this time point is measured
-\tparam Duration a std::chrono::duration type used to measure the time since epoch
-*/
-template<typename T>
+    hour = static_cast<int>(details::parse_two_digits(begin));
+    minute = static_cast<int>(details::parse_two_digits(begin + 3));
+    second = static_cast<int>(details::parse_two_digits(begin + 6));
+
+    switch (end - begin) {
+        case 12:  // .sss
+            nanosecond = static_cast<int>(details::parse_two_digits(begin + 9) * 10U +
+                                          std::uint32_t(begin[11] - '0')) *
+                         1000000L;
+            break;
+        case 15:  // .ssssss
+            nanosecond = static_cast<int>(details::parse_four_digits(begin + 9) * 100U +
+                                          details::parse_two_digits(begin + 13)) *
+                         1000L;
+            break;
+        case 18:  // .sssssssss
+            nanosecond = static_cast<int>(details::parse_eight_digits(begin + 9) * 10U +
+                                          std::uint32_t(begin[17] - '0'));
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
+template <typename T>
 struct is_time_point : std::false_type {};
 
-template<typename Clock, typename Duration>
+template <typename Clock, typename Duration>
 struct is_time_point<std::chrono::time_point<Clock, Duration>> : std::true_type {};
 
-/*
-\brief Internal ascii-to-timepoint conversion with millisecond precision.
+// Past year 2200, days_since_epoch * 86400 * 1e9 overflows int64.
+inline constexpr int kMinSupportedYear = 1970;
+inline constexpr int kMaxSupportedYear = 2200;
 
-Parses ascii and returns a std::chrono::time_point.
-
-\param begin Pointer to the beginning of the ascii string.
-\param end Pointer to past-the-end of the ascii string.
-\param[out] tp time_point.
-\return True if successful and the out arguments were set.
-*/
 template <typename TimePoint>
-inline typename std::enable_if<details::is_time_point<TimePoint>::value, bool>::type
-atotimepoint(
-    char const* begin,
-    char const* end,
-    TimePoint& tp
-)
-{
-    // TODO: after c++20 this simplifies to
-    //       std::chrono::parse("%Y%m%d-%T", tp);
+inline typename std::enable_if<details::is_time_point<TimePoint>::value, bool>::type atotimepoint(
+    char const* begin, char const* end, TimePoint& tp) {
+    if (end - begin < 9)
+        return false;
     int year, month, day, hour, minute, second, millisecond;
     if (!atotime(begin + 9, end, hour, minute, second, millisecond))
         return false;
     if (!atodate(begin, begin + 8, year, month, day))
         return false;
+    if (year < kMinSupportedYear || year > kMaxSupportedYear || month < 1 || month > 12 ||
+        day < 1 || day > 31)
+        return false;
 
     // from http://howardhinnant.github.io/date_algorithms.html
     year -= month <= 2;
-    const unsigned era = (year >= 0 ? year : year - 399) / 400;
-    const unsigned yoe = static_cast<unsigned>(year - era * 400);
-    const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    const unsigned long days_since_epoch = era * 146097 + static_cast<unsigned>(doe) - 719468;
+    unsigned const era = static_cast<unsigned>(year) / 400u;
+    unsigned const yoe = static_cast<unsigned>(year) - era * 400u;
+    unsigned const doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    unsigned const doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    std::int64_t const days_since_epoch =
+        static_cast<std::int64_t>(era) * 146097 + static_cast<std::int64_t>(doe) - 719468;
 
-    tp = TimePoint(std::chrono::seconds(days_since_epoch * 24 * 3600) +
-                   std::chrono::hours(hour) +
-                   std::chrono::minutes(minute) +
-                   std::chrono::seconds(second) +
+    tp = TimePoint(std::chrono::seconds(days_since_epoch * 86400) + std::chrono::hours(hour) +
+                   std::chrono::minutes(minute) + std::chrono::seconds(second) +
                    std::chrono::milliseconds(millisecond));
 
     return true;
 }
 
-/*
-\brief Internal ascii-to-timepoint conversion with nanosecond precision.
-
-Parses ascii and returns a std::chrono::time_point.
-
-\param begin Pointer to the beginning of the ascii string.
-\param end Pointer to past-the-end of the ascii string.
-\param[out] tp time_point.
-\return True if successful and the out arguments were set.
-*/
 template <typename TimePoint>
-inline typename std::enable_if<details::is_time_point<TimePoint>::value, bool>::type
-atotimepoint_nano(
-    char const* begin,
-    char const* end,
-    TimePoint& tp
-)
-{
-    // TODO: after c++20 this simplifies to
-    //       std::chrono::parse("%Y%m%d-%T", tp);
+inline typename std::enable_if<details::is_time_point<TimePoint>::value, bool>::type atotimepoint_nano(
+    char const* begin, char const* end, TimePoint& tp) {
+    if (end - begin < 9)
+        return false;
     int year, month, day, hour, minute, second, nanosecond;
     if (!atotime_nano(begin + 9, end, hour, minute, second, nanosecond))
         return false;
     if (!atodate(begin, begin + 8, year, month, day))
         return false;
+    if (year < kMinSupportedYear || year > kMaxSupportedYear || month < 1 || month > 12 ||
+        day < 1 || day > 31)
+        return false;
 
     // from http://howardhinnant.github.io/date_algorithms.html
     year -= month <= 2;
-    const unsigned era = (year >= 0 ? year : year - 399) / 400;
-    const unsigned yoe = static_cast<unsigned>(year - era * 400);
-    const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    const unsigned long days_since_epoch = era * 146097 + static_cast<unsigned>(doe) - 719468;
+    unsigned const era = static_cast<unsigned>(year) / 400u;
+    unsigned const yoe = static_cast<unsigned>(year) - era * 400u;
+    unsigned const doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    unsigned const doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    std::int64_t const days_since_epoch =
+        static_cast<std::int64_t>(era) * 146097 + static_cast<std::int64_t>(doe) - 719468;
 
-    tp = TimePoint(std::chrono::seconds(days_since_epoch * 24 * 3600) +
-                   std::chrono::hours(hour) +
-                   std::chrono::minutes(minute) +
-                   std::chrono::seconds(second) +
+    tp = TimePoint(std::chrono::seconds(days_since_epoch * 86400) + std::chrono::hours(hour) +
+                   std::chrono::minutes(minute) + std::chrono::seconds(second) +
                    std::chrono::nanoseconds(nanosecond));
 
     return true;
 }
 
-/*
-\brief Internal ascii-to-timepoint conversion with millisecond precision.
-
-Parses ascii and returns a std::chrono::time_point.
-
-\param tp TimePoint to parse.
-\param[out] year Year.
-\param[out] month Month.
-\param[out] day Day.
-\param[out] hour Hour.
-\param[out] minute Minute.
-\param[out] second Second.
-\param[out] millisecond Millisecond.
-*/
 template <typename TimePoint>
-inline typename std::enable_if<details::is_time_point<TimePoint>::value, void>::type
-timepointtoparts(TimePoint tp, int& year, int& month, int& day,
-                 int& hour, int& minute, int& second, int& millisecond) noexcept
-{
-    auto epoch_sec = std::chrono::time_point_cast<
-        std::chrono::seconds>(tp).time_since_epoch().count();
+inline typename std::enable_if<details::is_time_point<TimePoint>::value, void>::type timepointtoparts(
+    TimePoint tp,
+    int& year,
+    int& month,
+    int& day,
+    int& hour,
+    int& minute,
+    int& second,
+    int& millisecond) noexcept {
+    auto epoch_sec =
+        std::chrono::time_point_cast<std::chrono::seconds>(tp).time_since_epoch().count();
     auto day_sec = epoch_sec - (epoch_sec % 86400);
     auto days_since_epoch = day_sec / 86400;
 
     // see http://howardhinnant.github.io/date_algorithms.html
     days_since_epoch += 719468;
-    const unsigned era = (days_since_epoch >= 0 ? days_since_epoch : days_since_epoch - 146096) / 146097;
-    const unsigned doe = static_cast<unsigned>(days_since_epoch - era * 146097);
-    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned const era =
+        (days_since_epoch >= 0 ? days_since_epoch : days_since_epoch - 146096) / 146097;
+    unsigned const doe = static_cast<unsigned>(days_since_epoch - era * 146097);
+    unsigned const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     year = static_cast<unsigned>(yoe) + era * 400;
-    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const unsigned mp = (5 * doy + 2) / 153;
+    unsigned const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned const mp = (5 * doy + 2) / 153;
     day = doy - (153 * mp + 2) / 5 + 1;
     month = mp + (mp < 10 ? 3 : -9);
     year += month <= 2;
 
     auto in_day = tp - std::chrono::seconds(day_sec);
-    millisecond = std::chrono::time_point_cast<std::chrono::milliseconds>(
-            in_day).time_since_epoch().count();
+    millisecond =
+        std::chrono::time_point_cast<std::chrono::milliseconds>(in_day).time_since_epoch().count();
     hour = millisecond / (60 * 60 * 1000);
     millisecond -= hour * 60 * 60 * 1000;
     minute = millisecond / (60 * 1000);
@@ -529,46 +556,38 @@ timepointtoparts(TimePoint tp, int& year, int& month, int& day,
     millisecond -= second * 1000;
 }
 
-/*
-\brief Internal ascii-to-timepoint conversion with nanosecond precision.
-
-Parses ascii and returns a std::chrono::time_point.
-
-\param tp TimePoint to parse.
-\param[out] year Year.
-\param[out] month Month.
-\param[out] day Day.
-\param[out] hour Hour.
-\param[out] minute Minute.
-\param[out] second Second.
-\param[out] nanosecond Nanosecond.
-*/
 template <typename TimePoint>
 inline typename std::enable_if<details::is_time_point<TimePoint>::value, void>::type
-timepointtoparts_nano(TimePoint tp, int& year, int& month, int& day,
-                      int& hour, int& minute, int& second, int& nanosecond) noexcept
-{
-    auto epoch_sec = std::chrono::time_point_cast<
-        std::chrono::seconds>(tp).time_since_epoch().count();
+timepointtoparts_nano(TimePoint tp,
+                      int& year,
+                      int& month,
+                      int& day,
+                      int& hour,
+                      int& minute,
+                      int& second,
+                      int& nanosecond) noexcept {
+    auto epoch_sec =
+        std::chrono::time_point_cast<std::chrono::seconds>(tp).time_since_epoch().count();
     auto day_sec = epoch_sec - (epoch_sec % 86400);
     auto days_since_epoch = day_sec / 86400;
 
     // see http://howardhinnant.github.io/date_algorithms.html
     days_since_epoch += 719468;
-    const unsigned era = (days_since_epoch >= 0 ? days_since_epoch : days_since_epoch - 146096) / 146097;
-    const unsigned doe = static_cast<unsigned>(days_since_epoch - era * 146097);
-    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned const era =
+        (days_since_epoch >= 0 ? days_since_epoch : days_since_epoch - 146096) / 146097;
+    unsigned const doe = static_cast<unsigned>(days_since_epoch - era * 146097);
+    unsigned const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     year = static_cast<unsigned>(yoe) + era * 400;
-    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const unsigned mp = (5 * doy + 2) / 153;
+    unsigned const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned const mp = (5 * doy + 2) / 153;
     day = doy - (153 * mp + 2) / 5 + 1;
     month = mp + (mp < 10 ? 3 : -9);
     year += month <= 2;
 
     // the math here must be in higher precision, but at the end it fits in an int
     auto in_day = tp - std::chrono::seconds(day_sec);
-    long lnanosecond = std::chrono::time_point_cast<std::chrono::nanoseconds>(
-            in_day).time_since_epoch().count();
+    long lnanosecond =
+        std::chrono::time_point_cast<std::chrono::nanoseconds>(in_day).time_since_epoch().count();
     hour = lnanosecond / (60 * 60 * 1000000000L);
     lnanosecond -= hour * 60 * 60 * 1000000000L;
     minute = lnanosecond / (60 * 1000000000L);
@@ -577,983 +596,527 @@ timepointtoparts_nano(TimePoint tp, int& year, int& month, int& day,
     lnanosecond -= second * 1000000000L;
     nanosecond = static_cast<int>(lnanosecond);
 }
-#endif
 
-} // namespace details
+}  // namespace details
 
 /* @endcond*/
 
-/*!
- * \brief One FIX message for writing.
- *
- * Given a buffer, the message_writer will write a FIX message to the buffer. message_writer does not take ownership of the buffer.
- *
- * <h3>Usage</h3>
- *
- * The message_writer interface is patterned after
- * Back Insertion Sequence Containers, with overloads of `push_back` for different FIX field data types.
- *
- * The `push_back_header()` method will write the _BeginString_ and _BodyLength_ fields to the message,
- * and the FIX Standard Message Header requires also _MsgType_, _SenderCompID_, _TargetCompID_, _MsgSeqNum_ and _SendingTime_.
- * You must write those fields yourself, starting with _MsgType_.
- *
- * After calling all other `push_back` methods and before sending the message, you must call push_back_trailer(),
- * which will write the CheckSum field for you.
- *
- * <h3>Extension</h3>
- *
- * Keep in mind that if you don't like the way any of these `push_back` methods
- * perform serialization, then you can always do your own serialization for any
- * data type, and then append it to the message by `push_back_string()`.
- *
- * For example, these two statements are equivalent for `hffix::message_writer w`.
- *
- * \code
- * w.push_back_int   (hffix::tag::HeartBtInt, 12);
- * w.push_back_string(hffix::tag::HeartBtInt, "12");
- * \endcode
- *
- * For another example, if a trading peer has extended FIX for femtosecond timestamp precision, then a custom timestamp can be serialized to a string and then written to a field.
- *
- * \code
- * w.push_back_string(hffix::tag::SendingTime, "20180309-13:46:01.0123456789123456");
- * \endcode
+/**
+ * \brief noexcept FIX writer. Overflow sets error flag; push_back_* no-op
+ * afterwards. Caller checks push_back_trailer() return.
  */
 class message_writer {
 public:
+    explicit message_writer(std::span<char> buffer) noexcept
+        : buffer_(buffer.data()), buffer_end_(buffer.data() + buffer.size()), next_(buffer.data()) {}
 
-    /*!
-    \brief Construct by buffer size.
-    \param buffer Pointer to the buffer to be written to.
-    \param size Size of the buffer in bytes.
-    */
-    message_writer(char* buffer, size_t size):
-        buffer_(buffer),
-        buffer_end_(buffer + size),
-        next_(buffer),
-        body_length_(NULL) {
+    message_writer(char* buffer, std::size_t size) noexcept
+        : message_writer(std::span<char>(buffer, size)) {}
+
+    message_writer(char* begin, char* end) noexcept
+        : message_writer(std::span<char>(begin, static_cast<std::size_t>(end - begin))) {}
+
+    template <std::size_t N>
+    explicit message_writer(char (&buffer)[N]) noexcept
+        : buffer_(buffer), buffer_end_(buffer + N), next_(buffer) {}
+
+    [[nodiscard]] bool ok() const noexcept { return !error_; }
+
+    bool has_error() const noexcept { return error_; }
+
+    char* message_begin() const noexcept { return buffer_; }
+
+    char* message_end() const noexcept { return next_; }
+
+    std::size_t message_size() const noexcept { return static_cast<std::size_t>(next_ - buffer_); }
+
+    std::size_t buffer_size() const noexcept {
+        return static_cast<std::size_t>(buffer_end_ - buffer_);
     }
 
-    /*!
-    \brief Construct by buffer begin and end.
-    \param begin Pointer to the buffer to be written to.
-    \param end Pointer to past-the-end of the buffer to be written to.
-    */
-    message_writer(char* begin, char* end) :
-        buffer_(begin),
-        buffer_end_(end),
-        next_(begin),
-        body_length_(NULL) {
+    std::size_t buffer_size_remaining() const noexcept {
+        return static_cast<std::size_t>(buffer_end_ - next_);
     }
 
-    /*!
-    \brief Construct on an array reference to a buffer.
-    \tparam N The size of the array.
-    \param buffer An array reference. The writer will write into the entire array of length _N_.
-    */
-    template<size_t N>
-    message_writer(char(&buffer)[N]) :
-        buffer_(buffer),
-        buffer_end_(&(buffer[N])),
-        next_(buffer),
-        body_length_(NULL) {
-    }
-
-
-    /*!
-     * \brief Owns no resources, so destruction is no-op.
-     */
-    ~message_writer() {}
-
-    /*! \name Buffer Access */
-    //@{
-
-    /*!
-    \brief Size of the message in bytes.
-     *
-     * \pre push_back_trailer() has been called.
-    */
-    size_t message_size() const {
-        return next_ - buffer_;
-    }
-
-    /*!
-     * \brief Pointer to beginning of the message.
-     *
-     * \pre None.
-     */
-    char* message_begin() const {
-        return buffer_;
-    }
-    /*!
-     * \brief Pointer to past-the-end of the message.
-     *
-     * \pre push_back_trailer() has been called.
-     */
-    char* message_end() const {
-        return next_;
-    }
-
-    /*!
-     * \brief Total available buffer size, including buffer already written to by this message.
-     */
-    size_t buffer_size() const {
-        return buffer_end_ - buffer_;
-    }
-
-    /*!
-     * \brief Remaining available buffer size. Excludes buffer already written to by this message.
-     */
-    size_t buffer_size_remaining() const {
-        return buffer_end_ - next_;
-    }
-
-    //@}
-
-    /*! \name Transport Fields */
-    //@{
-
-    /*!
-     * \brief Write the _BeginString_ and _BodyLength_ fields to the buffer.
-     *
-     * This method must be called before any other `push_back` method. It may only be called once for each message_writer.
-     *
-     * \pre No other `push_back` method has yet been called.
-     * \param begin_string_version The value for the BeginString FIX field. Should probably be "FIX.4.2" or "FIX.4.3" or "FIX.4.4" or "FIXT.1.1" (for FIX 5.0).
-     *
-     * \throw std::out_of_range When the remaining buffer size is too small.
-     * \throw std::logic_error When called more than once for a single message.
-     */
-    void push_back_header(char const* begin_string_version) {
-        if (body_length_) throw std::logic_error("hffix message_writer.push_back_header called twice");
-        if (buffer_end_ - next_ < 2 + std::ptrdiff_t(strlen(begin_string_version)) + 3 + 7) {
-            details::throw_range_error();
-        }
-        memcpy(next_, "8=", 2);
-        next_ += 2;
-        memcpy(next_, begin_string_version, std::strlen(begin_string_version));
-        next_ += std::strlen(begin_string_version);
-        *(next_++) = '\x01';
-        memcpy(next_, "9=", 2);
-        next_ += 2;
-        body_length_ = next_;
-        next_ += 6; // 6 characters reserved for BodyLength.
-        *next_++ = '\x01';
-    }
-
-#if __cplusplus >= 201703L
-    /*!
-     * \brief Write the _BeginString_ and _BodyLength_ fields to the buffer.
-     *
-     * This method must be called before any other `push_back` method. It may only be called once for each message_writer.
-     *
-     * \pre No other `push_back` method has yet been called.
-     * \param begin_string_version The value for the BeginString FIX field. Should probably be "FIX.4.2" or "FIX.4.3" or "FIX.4.4" or "FIXT.1.1" (for FIX 5.0).
-     *
-     * \throw std::out_of_range When the remaining buffer size is too small.
-     * \throw std::logic_error When called more than once for a single message.
-     */
-    void push_back_header(std::string_view begin_string_version) {
-        if (body_length_) throw std::logic_error("hffix message_writer.push_back_header called twice");
-        if (buffer_end_ - next_ < 2 + std::ptrdiff_t(begin_string_version.size()) + 3 + 7) {
-            details::throw_range_error();
-        }
-        memcpy(next_, "8=", 2);
-        next_ += 2;
-        memcpy(next_, begin_string_version.data(), begin_string_version.size());
-        next_ += begin_string_version.size();
-        *(next_++) = '\x01';
-        memcpy(next_, "9=", 2);
-        next_ += 2;
-        body_length_ = next_;
-        next_ += 6; // 6 characters reserved for BodyLength.
-        *next_++ = '\x01';
-    }
-#endif
-
-    /*!
-     * \brief Write the _CheckSum_ field to the buffer.
-     *
-     * This function must be called after all other `push_back` functions. It may only be called once for each message_writer.
-     *
-     * \pre push_back_header() method has been called.
-     *
-     * \post There is a complete and valid FIX message in the buffer.
-     *
-     * \param calculate_checksum If this flag is set to false, then instead of iterating over the entire message and
-     * calculating the CheckSum, the standard trailer will simply write CheckSum=000. This is fine if you're sending
-     * the message to a FIX parser that, like High Frequency FIX Parser, doesn't care about the CheckSum.
-     *
-     * \throw std::out_of_range When the remaining buffer size is too small.
-     * \throw std::logic_error When called before message_writer::push_back_header()
-     */
-    void push_back_trailer(bool calculate_checksum = true) {
-        // Calculate and write out the BodyLength.
-        // BodyLength does not include the SOH character after the BodyLength field.
-        // BodyLength does not include the SOH character before the CheckSum field.
+    template <bool CalculateChecksum = true>
+    [[nodiscard]] bool push_back_trailer() noexcept {
+        if (error_)
+            return false;
         if (!body_length_) {
-            throw std::logic_error("hffix message_writer.push_back_trailer called before message_writer.push_back_header");
+            error_ = true;
+            return false;
         }
-
-        size_t const len = next_ - (body_length_ + 7);
-        body_length_[0] = '0' + (len / 100000) % 10;
-        body_length_[1] = '0' + (len / 10000) % 10;
-        body_length_[2] = '0' + (len / 1000) % 10;
-        body_length_[3] = '0' + (len / 100) % 10;
-        body_length_[4] = '0' + (len / 10) % 10;
-        body_length_[5] = '0' + len % 10;
-
+        std::size_t const len = static_cast<std::size_t>(next_ - (body_length_ + 7));
+        // BodyLength is 6 digits; >999999 would wrap in itoa_padded_unchecked.
+        if (len > 999999u) [[unlikely]] {
+            error_ = true;
+            return false;
+        }
+        details::itoa_padded_unchecked(static_cast<int>(len), body_length_, body_length_ + 6);
         if (buffer_end_ - next_ < 7) {
-            details::throw_range_error();
+            error_ = true;
+            return false;
         }
-
-        // write out the CheckSum after optionally calculating it
-        if (calculate_checksum) {
-#if __cplusplus >= 201103L
+        if constexpr (CalculateChecksum) {
             using std::uint8_t;
-#else
-            typedef unsigned char uint8_t;
-#endif
-            uint8_t const checksum = std::accumulate(buffer_, next_, uint8_t(0));
-
-            memcpy(next_, "10=", 3);
+            uint8_t const checksum = details::checksum_bytes(buffer_, next_);
+            std::memcpy(next_, "10=", 3);
             next_ += 3;
-            next_[0] = '0' + ((checksum / 100) % 10);
-            next_[1] = '0' + ((checksum / 10) % 10);
-            next_[2] = '0' + (checksum % 10);
-
+            next_[0] = static_cast<char>('0' + ((checksum / 100) % 10));
+            next_[1] = static_cast<char>('0' + ((checksum / 10) % 10));
+            next_[2] = static_cast<char>('0' + (checksum % 10));
             next_ += 3;
             *next_++ = '\x01';
         } else {
-            memcpy(next_, "10=000\x01", 7);
+            std::memcpy(next_, "10=000\x01", 7);
             next_ += 7;
         }
-
+        return true;
     }
 
-    //@}
-
-    /*! \name String Fields */
-    //@{
-
-    /*!
-    \brief Append a string field to the message.
-
-    \param tag FIX tag.
-    \param begin Pointer to the beginning of the string.
-    \param end Pointer to past-the-end of the string.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_string(int tag, char const* begin, char const* end) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < (end - begin) + 2) {
-            details::throw_range_error();
+    void push_back_header(char const* begin, char const* end) noexcept {
+        if (error_)
+            return;
+        if (body_length_) {
+            error_ = true;
+            return;
         }
-        *next_++ = '=';
-        memcpy(next_, begin, end - begin);
-        next_ += (end - begin);
+        std::ptrdiff_t const vlen = end - begin;
+        if (buffer_end_ - next_ < 2 + vlen + 3 + 7) {
+            error_ = true;
+            return;
+        }
+        std::memcpy(next_, "8=", 2);
+        next_ += 2;
+        std::memcpy(next_, begin, static_cast<std::size_t>(vlen));
+        next_ += vlen;
+        *next_++ = '\x01';
+        std::memcpy(next_, "9=", 2);
+        next_ += 2;
+        body_length_ = next_;
+        next_ += 6;
         *next_++ = '\x01';
     }
 
-    /*!
-    \brief Append a string field to the message.
-
-    \param tag FIX tag.
-    \param cstring Pointer to the beginning of a C-style null-terminated string.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_string(int tag, char const* cstring) {
-        // Find the end of the cstring, like strlen, but throw if the cstring
-        // is longer than the remaining buffer.
-        char const* cstring_end = (char const*)memchr(cstring, 0, buffer_end_ - next_);
-        if (cstring_end) push_back_string(tag, cstring, cstring_end);
-        else details::throw_range_error();
+    /** String-literal overload; runtime char const* must be wrapped in std::string_view. */
+    template <std::size_t N>
+    void push_back_header(char const (&literal)[N]) noexcept {
+        static_assert(N > 0);
+        push_back_header(literal, literal + (N - 1));
     }
 
-    /*!
-    \brief Append a string field to the message.
+    void push_back_header(std::string_view v) noexcept {
+        push_back_header(v.data(), v.data() + v.size());
+    }
 
-    The entire, literal contents of s will be copied to the output buffer, so if you are using std::wstring
-    you may need to first convert from UTF-32 to UTF-8, or do some other encoding transformation.
+    void push_back_string(int tag, char const* begin, char const* end) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const slen = end - begin;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + slen + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
+        }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
+        *next_++ = '=';
+        std::memcpy(next_, begin, static_cast<std::size_t>(slen));
+        next_ += slen;
+        *next_++ = '\x01';
+    }
 
-    \param tag FIX tag.
-    \param s String.
+    /** String-literal overload; runtime char const* must be wrapped in std::string_view. */
+    template <std::size_t N>
+    void push_back_string(int tag, char const (&literal)[N]) noexcept {
+        static_assert(N > 0);
+        push_back_string(tag, literal, literal + (N - 1));
+    }
 
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_string(int tag, std::string const& s) {
+    void push_back_string(int tag, std::string_view s) noexcept {
         push_back_string(tag, s.data(), s.data() + s.size());
     }
 
-
-#if __cplusplus >= 201703L
-    /*!
-    \brief Append a string field to the message.
-
-    The range of s will be copied to the output buffer.
-
-    \param tag FIX tag.
-    \param s String.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_string(int tag, std::string_view s) {
-        push_back_string(tag, s.data(), s.data() + s.length());
-    }
-#endif
-
-    /*!
-    \brief Append a char field to the message.
-
-    \param tag FIX tag.
-    \param character An ascii character.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_char(int tag, char character) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < 3) {
-            details::throw_range_error();
+    void push_back_char(int tag, char c) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 1 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
         }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
         *next_++ = '=';
-        *next_++ = character;
-        *next_++ = '\x01';
-    }
-//@}
-
-    /*! \name Integer Fields */
-//@{
-    /*!
-    \brief Append an integer field to the message.
-
-    \tparam Int_type Type of integer.
-    \param tag FIX tag.
-    \param number Integer value.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    template<typename Int_type> void push_back_int(int tag, Int_type number) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (next_ >= buffer_end_) details::throw_range_error();
-        *next_++ = '=';
-        next_ = details::itoa(number, next_, buffer_end_);
-        if (next_ >= buffer_end_) details::throw_range_error();
+        *next_++ = c;
         *next_++ = '\x01';
     }
 
-//@}
-
-    /*! \name Decimal Float Fields */
-//@{
-
-    /*!
-    \brief Append a decimal float field to the message.
-
-    The decimal float is of the form \htmlonly mantissa&times;10<sup>exponent</sup>\endhtmlonly.
-
-    Non-normalized. The exponent parameter must be less than or equal to zero. If the exponent
-    parameter is zero, no decimal point will be written to the ascii field.
-
-    \tparam Int_type Integer type for the mantissa and exponent.
-    \param tag FIX tag.
-    \param mantissa The mantissa of the decimal float.
-    \param exponent The exponent of the decimal float. Must be less than or equal to zero.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    template<typename Int_type> void push_back_decimal(int tag, Int_type mantissa, Int_type exponent) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (next_ >= buffer_end_) details::throw_range_error();
-        *next_++ = '=';
-        next_ = details::dtoa(mantissa, exponent, next_, buffer_end_);
-        if (next_ >= buffer_end_) details::throw_range_error();
-        *next_++ = '\x01';
-    }
-//@}
-
-
-    /*! \name Date and Time Fields */
-//@{
-
-    /*!
-    \brief Append a LocalMktDate or UTCDate field to the message.
-
-    \param tag FIX tag.
-    \param year Year.
-    \param month Month.
-    \param day Day.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_date(int tag, int year, int month, int day) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < details::len("=YYYYMMDD|")) {
-            details::throw_range_error();
+    template <class Int_type>
+    void push_back_int(int tag, Int_type n) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need =
+            details::max_ascii_chars<int> + 1 + details::max_ascii_chars<Int_type> + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
         }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
         *next_++ = '=';
-        itoa_padded(year, next_, next_ + 4);
+        next_ = details::itoa_unchecked(n, next_);
+        *next_++ = '\x01';
+    }
+
+    template <class Int_type>
+    void push_back_decimal(int tag, Int_type mantissa, Int_type exponent) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need =
+            details::max_ascii_chars<int> + 1 + details::max_ascii_chars<Int_type> + 1 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
+        }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
+        *next_++ = '=';
+        next_ = details::dtoa_unchecked(mantissa, exponent, next_);
+        *next_++ = '\x01';
+    }
+
+    void push_back_date(int tag, int y, int m, int d) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 8 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
+        }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
+        *next_++ = '=';
+        details::itoa_padded_unchecked(y, next_, next_ + 4);
         next_ += 4;
-        itoa_padded(month, next_, next_ + 2);
+        details::itoa_padded_unchecked(m, next_, next_ + 2);
         next_ += 2;
-        itoa_padded(day, next_, next_ + 2);
+        details::itoa_padded_unchecked(d, next_, next_ + 2);
         next_ += 2;
         *next_++ = '\x01';
     }
-    /*!
-    \brief Append a month-year field to the message.
 
-    \param tag FIX tag.
-    \param year Year.
-    \param month Month.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_monthyear(int tag, int year, int month) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < details::len("=YYYYMM|")) {
-            details::throw_range_error();
+    void push_back_monthyear(int tag, int y, int m) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 6 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
         }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
         *next_++ = '=';
-        itoa_padded(year, next_, next_ + 4);
+        details::itoa_padded_unchecked(y, next_, next_ + 4);
         next_ += 4;
-        itoa_padded(month, next_, next_ + 2);
+        details::itoa_padded_unchecked(m, next_, next_ + 2);
         next_ += 2;
         *next_++ = '\x01';
     }
 
-    /*!
-    \brief Append a UTCTimeOnly field to the message.
-
-    No time zone or daylight savings time transformations are done to the time.
-
-    No fractional seconds are written to the field.
-
-    \param tag FIX tag.
-    \param hour Hour.
-    \param minute Minute.
-    \param second Second.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_timeonly(int tag, int hour, int minute, int second) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < details::len("=HH:MM:SS|")) {
-            details::throw_range_error();
+    void push_back_timeonly(int tag, int h, int m, int s) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 8 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
         }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
         *next_++ = '=';
-        itoa_padded(hour, next_, next_ + 2);
+        details::itoa_padded_unchecked(h, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(minute, next_, next_ + 2);
+        details::itoa_padded_unchecked(m, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(second, next_, next_ + 2);
+        details::itoa_padded_unchecked(s, next_, next_ + 2);
         next_ += 2;
         *next_++ = '\x01';
     }
 
-    /*!
-    \brief Append a UTCTimeOnly field to the message with millisecond precision.
-
-    No time zone or daylight savings time transformations are done to the time.
-
-    \param tag FIX tag.
-    \param hour Hour.
-    \param minute Minute.
-    \param second Second.
-    \param millisecond Millisecond.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_timeonly(int tag, int hour, int minute, int second, int millisecond) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < details::len("=HH:MM:SS.sss|")) {
-            details::throw_range_error();
+    void push_back_timeonly(int tag, int h, int m, int s, int ms) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 12 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
         }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
         *next_++ = '=';
-        itoa_padded(hour, next_, next_ + 2);
+        details::itoa_padded_unchecked(h, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(minute, next_, next_ + 2);
+        details::itoa_padded_unchecked(m, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(second, next_, next_ + 2);
+        details::itoa_padded_unchecked(s, next_, next_ + 2);
         next_ += 2;
         *next_++ = '.';
-        itoa_padded(millisecond, next_, next_ + 3);
+        details::itoa_padded_unchecked(ms, next_, next_ + 3);
         next_ += 3;
         *next_++ = '\x01';
     }
 
-    /*!
-    \brief Append a UTCTimeOnly field to the message with up to nanosecond precision.
+    template <class Rep, class Period>
+    void push_back_timeonly(int tag, std::chrono::duration<Rep, Period> t) noexcept {
+        using namespace std::chrono;
+        push_back_timeonly(tag,
+                           static_cast<int>(duration_cast<hours>(t).count()),
+                           static_cast<int>(duration_cast<minutes>(t % hours(1)).count()),
+                           static_cast<int>(duration_cast<seconds>(t % minutes(1)).count()),
+                           static_cast<int>(duration_cast<milliseconds>(t % seconds(1)).count()));
+    }
 
-    No time zone or daylight savings time transformations are done to the time.
-
-    \param tag FIX tag.
-    \param hour Hour.
-    \param minute Minute.
-    \param second Second.
-    \param nanosecond Nanosecond.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_timeonly_nano(int tag, int hour, int minute, int second, int nanosecond) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < details::len("=HH:MM:SS.sssssssss|")) {
-            details::throw_range_error();
+    void push_back_timeonly_nano(int tag, int h, int m, int s, int ns) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 18 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
         }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
         *next_++ = '=';
-        itoa_padded(hour, next_, next_ + 2);
+        details::itoa_padded_unchecked(h, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(minute, next_, next_ + 2);
+        details::itoa_padded_unchecked(m, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(second, next_, next_ + 2);
+        details::itoa_padded_unchecked(s, next_, next_ + 2);
         next_ += 2;
         *next_++ = '.';
-        itoa_padded(nanosecond, next_, next_ + 9);
+        details::itoa_padded_unchecked(ns, next_, next_ + 9);
         next_ += 9;
         *next_++ = '\x01';
     }
 
-    /*!
-    \brief Append a UTCTimestamp field to the message.
+    template <class Rep, class Period>
+    void push_back_timeonly_nano(int tag, std::chrono::duration<Rep, Period> t) noexcept {
+        using namespace std::chrono;
+        push_back_timeonly_nano(tag,
+                                static_cast<int>(duration_cast<hours>(t).count()),
+                                static_cast<int>(duration_cast<minutes>(t % hours(1)).count()),
+                                static_cast<int>(duration_cast<seconds>(t % minutes(1)).count()),
+                                static_cast<int>(duration_cast<nanoseconds>(t % seconds(1)).count()));
+    }
 
-    No time zone or daylight savings time transformations are done to the timestamp.
-
-    No fractional seconds are written to the field.
-
-    \param tag FIX tag.
-    \param year Year.
-    \param month Month.
-    \param day Day.
-    \param hour Hour.
-    \param minute Minute.
-    \param second Second.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_timestamp(int tag, int year, int month, int day, int hour, int minute, int second) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-
-        if (buffer_end_ - next_ < details::len("=YYYYMMDD-HH:MM:SS|")) {
-            details::throw_range_error();
+    void push_back_timestamp(int tag, int y, int mo, int d, int h, int mi, int s) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 17 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
         }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
         *next_++ = '=';
-        itoa_padded(year, next_, next_ + 4);
+        details::itoa_padded_unchecked(y, next_, next_ + 4);
         next_ += 4;
-        itoa_padded(month, next_, next_ + 2);
+        details::itoa_padded_unchecked(mo, next_, next_ + 2);
         next_ += 2;
-        itoa_padded(day, next_, next_ + 2);
+        details::itoa_padded_unchecked(d, next_, next_ + 2);
         next_ += 2;
         *next_++ = '-';
-        itoa_padded(hour, next_, next_ + 2);
+        details::itoa_padded_unchecked(h, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(minute, next_, next_ + 2);
+        details::itoa_padded_unchecked(mi, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(second, next_, next_ + 2);
+        details::itoa_padded_unchecked(s, next_, next_ + 2);
         next_ += 2;
         *next_++ = '\x01';
     }
 
-    /*!
-    \brief Append a UTCTimestamp field to the message with millisecond precision.
-
-    No time zone or daylight savings time transformations are done to the timestamp.
-
-    \param tag FIX tag.
-    \param year Year.
-    \param month Month.
-    \param day Day.
-    \param hour Hour.
-    \param minute Minute.
-    \param second Second.
-    \param millisecond Millisecond.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_timestamp(int tag, int year, int month, int day, int hour, int minute, int second, int millisecond) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < details::len("=YYYYMMDD-HH:MM:SS.sss|")) {
-            details::throw_range_error();
+    void push_back_timestamp(int tag, int y, int mo, int d, int h, int mi, int s, int ms) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 21 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
         }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
         *next_++ = '=';
-        itoa_padded(year, next_, next_ + 4);
+        details::itoa_padded_unchecked(y, next_, next_ + 4);
         next_ += 4;
-        itoa_padded(month, next_, next_ + 2);
+        details::itoa_padded_unchecked(mo, next_, next_ + 2);
         next_ += 2;
-        itoa_padded(day, next_, next_ + 2);
+        details::itoa_padded_unchecked(d, next_, next_ + 2);
         next_ += 2;
         *next_++ = '-';
-        itoa_padded(hour, next_, next_ + 2);
+        details::itoa_padded_unchecked(h, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(minute, next_, next_ + 2);
+        details::itoa_padded_unchecked(mi, next_, next_ + 2);
         next_ += 2;
         *next_++ = ':';
-        itoa_padded(second, next_, next_ + 2);
+        details::itoa_padded_unchecked(s, next_, next_ + 2);
         next_ += 2;
         *next_++ = '.';
-        itoa_padded(millisecond, next_, next_ + 3);
+        details::itoa_padded_unchecked(ms, next_, next_ + 3);
         next_ += 3;
         *next_++ = '\x01';
     }
 
-    /*!
-    \brief Append a UTCTimestamp field to the message with nanosecond precision.
-
-    No time zone or daylight savings time transformations are done to the timestamp.
-
-    \param tag FIX tag.
-    \param year Year.
-    \param month Month.
-    \param day Day.
-    \param hour Hour.
-    \param minute Minute.
-    \param second Second.
-    \param nanosecond Nanosecond.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_timestamp_nano(int tag, int year, int month, int day, int hour, int minute, int second, int nanosecond) {
-        next_ = details::itoa(tag, next_, buffer_end_);
-        if (buffer_end_ - next_ < details::len("=YYYYMMDD-HH:MM:SS.sssssssss|")) {
-            details::throw_range_error();
-        }
-        *next_++ = '=';
-        itoa_padded(year, next_, next_ + 4);
-        next_ += 4;
-        itoa_padded(month, next_, next_ + 2);
-        next_ += 2;
-        itoa_padded(day, next_, next_ + 2);
-        next_ += 2;
-        *next_++ = '-';
-        itoa_padded(hour, next_, next_ + 2);
-        next_ += 2;
-        *next_++ = ':';
-        itoa_padded(minute, next_, next_ + 2);
-        next_ += 2;
-        *next_++ = ':';
-        itoa_padded(second, next_, next_ + 2);
-        next_ += 2;
-        *next_++ = '.';
-        itoa_padded(nanosecond, next_, next_ + 9);
-        next_ += 9;
-        *next_++ = '\x01';
-    }
-//@}
-
-#ifdef HFFIX_BOOST_DATETIME
-
-    /*! \name Boost Date and Time Fields */
-//@{
-
-    /*!
-    \brief Append a LocalMktDate or UTCDate field to the message.
-
-    \param tag FIX tag.
-    \param date Date.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-
-    \see HFFIX_NO_BOOST_DATETIME
-    */
-    void push_back_date(int tag, boost::gregorian::date date) {
-        if (!date.is_not_a_date())
-            push_back_date(tag, date.year(), date.month(), date.day());
-    }
-
-    /*!
-    \brief Append a UTCTimeOnly field to the message with millisecond precision.
-
-    No time zone or daylight savings time transformations are done to the time.
-
-    Fractional seconds will be written to the field, rounded to the millisecond.
-
-    \param tag FIX tag.
-    \param timeonly Time.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-
-    \see HFFIX_NO_BOOST_DATETIME
-    */
-    void push_back_timeonly(int tag, boost::posix_time::time_duration timeonly) {
-        if (!timeonly.is_not_a_date_time())
-            push_back_timeonly(
-                tag,
-                timeonly.hours(),
-                timeonly.minutes(),
-                timeonly.seconds(),
-                static_cast<int>(timeonly.fractional_seconds() * 1000 / boost::posix_time::time_duration::ticks_per_second())
-            );
-    }
-
-    /*!
-    \brief Append a UTCTimeOnly field to the message with nanosecond precision.
-
-    No time zone or daylight savings time transformations are done to the time.
-
-    Fractional seconds will be written to the field, rounded to the nanosecond.
-
-    \param tag FIX tag.
-    \param timeonly Time.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-
-    \see HFFIX_NO_BOOST_DATETIME
-    */
-    void push_back_timeonly_nano(int tag, boost::posix_time::time_duration timeonly) {
-        if (!timeonly.is_not_a_date_time())
-            push_back_timeonly_nano(
-                tag,
-                timeonly.hours(),
-                timeonly.minutes(),
-                timeonly.seconds(),
-                static_cast<int>(timeonly.fractional_seconds() * 1000000000L / boost::posix_time::time_duration::ticks_per_second())
-            );
-    }
-
-    /*!
-    \brief Append a UTCTimestamp field to the message with millisecond precision.
-
-    No time zone or daylight savings time transformations are done to the timestamp.
-
-    Fractional seconds will be written to the field, rounded to the millisecond.
-
-    \param tag FIX tag.
-    \param timestamp Date and time.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-
-    \see HFFIX_NO_BOOST_DATETIME
-    */
-    void push_back_timestamp(int tag, boost::posix_time::ptime timestamp) {
-        if (!timestamp.is_not_a_date_time())
-            push_back_timestamp(
-                tag,
-                timestamp.date().year(),
-                timestamp.date().month(),
-                timestamp.date().day(),
-                timestamp.time_of_day().hours(),
-                timestamp.time_of_day().minutes(),
-                timestamp.time_of_day().seconds(),
-                static_cast<int>(timestamp.time_of_day().fractional_seconds() * 1000 / boost::posix_time::time_duration::ticks_per_second())
-            );
-        else
-            throw std::logic_error("push_back_timestamp called with not_a_date_time.");
-    }
-
-    /*!
-    \brief Append a UTCTimestamp field to the message with nanosecond precision.
-
-    No time zone or daylight savings time transformations are done to the timestamp.
-
-    Fractional seconds will be written to the field, rounded to the nanosecond.
-
-    \param tag FIX tag.
-    \param timestamp Date and time.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-
-    \see HFFIX_NO_BOOST_DATETIME
-    */
-    void push_back_timestamp_nano(int tag, boost::posix_time::ptime timestamp) {
-        if (!timestamp.is_not_a_date_time())
-            push_back_timestamp_nano(
-                tag,
-                timestamp.date().year(),
-                timestamp.date().month(),
-                timestamp.date().day(),
-                timestamp.time_of_day().hours(),
-                timestamp.time_of_day().minutes(),
-                timestamp.time_of_day().seconds(),
-                static_cast<int>(timestamp.time_of_day().fractional_seconds() * 1000000000L / boost::posix_time::time_duration::ticks_per_second())
-            );
-        else
-            throw std::logic_error("push_back_timestamp_nano called with not_a_date_time.");
-    }
-//@}
-#endif // HFFIX_BOOST_DATETIME
-
-#if __cplusplus >= 201103L
-    /*! \name std::chrono Date and Time Fields */
-//@{
-
-    /*!
-    \brief Append a `std::chrono::time_point` field to the message with millisecond precision.
-
-    Fractional seconds will be written to the field, rounded to the millisecond.
-
-    Uses algorithms from http://howardhinnant.github.io/date_algorithms.html ,
-    which implement a proleptic Gregorian calendar. This will probably be
-    superseded by C++20.
-
-    \param tag FIX tag.
-    \param tp `std::chrono::time_point`.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    template<typename Clock, typename Duration>
-    void push_back_timestamp(int tag, std::chrono::time_point<Clock,Duration> tp) {
-        // TODO: with c++20, we can use std::chrono::format
+    template <class Clock, class Duration>
+    void push_back_timestamp(int tag, std::chrono::time_point<Clock, Duration> tp) noexcept {
         int year, month, day, hour, minute, second, millisecond;
         details::timepointtoparts(tp, year, month, day, hour, minute, second, millisecond);
         push_back_timestamp(tag, year, month, day, hour, minute, second, millisecond);
     }
 
-    /*!
-    \brief Append a `std::chrono::time_point` field to the message with nanosecond precision.
+    void push_back_timestamp_nano(int tag, int y, int mo, int d, int h, int mi, int s, int ns) noexcept {
+        if (error_)
+            return;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 + 27 + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
+        }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag), next_);
+        *next_++ = '=';
+        details::itoa_padded_unchecked(y, next_, next_ + 4);
+        next_ += 4;
+        details::itoa_padded_unchecked(mo, next_, next_ + 2);
+        next_ += 2;
+        details::itoa_padded_unchecked(d, next_, next_ + 2);
+        next_ += 2;
+        *next_++ = '-';
+        details::itoa_padded_unchecked(h, next_, next_ + 2);
+        next_ += 2;
+        *next_++ = ':';
+        details::itoa_padded_unchecked(mi, next_, next_ + 2);
+        next_ += 2;
+        *next_++ = ':';
+        details::itoa_padded_unchecked(s, next_, next_ + 2);
+        next_ += 2;
+        *next_++ = '.';
+        details::itoa_padded_unchecked(ns, next_, next_ + 9);
+        next_ += 9;
+        *next_++ = '\x01';
+    }
 
-    Fractional seconds will be written to the field, rounded to the nanosecond.
-
-    Uses algorithms from http://howardhinnant.github.io/date_algorithms.html ,
-    which implement a proleptic Gregorian calendar. This will probably be
-    superseded by C++20.
-
-    \param tag FIX tag.
-    \param tp `std::chrono::time_point`.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    template<typename Clock, typename Duration>
-    void push_back_timestamp_nano(int tag, std::chrono::time_point<Clock,Duration> tp) {
-        // TODO: with c++20, we can use std::chrono::format
+    template <class Clock, class Duration>
+    void push_back_timestamp_nano(int tag, std::chrono::time_point<Clock, Duration> tp) noexcept {
         int year, month, day, hour, minute, second, nanosecond;
         details::timepointtoparts_nano(tp, year, month, day, hour, minute, second, nanosecond);
         push_back_timestamp_nano(tag, year, month, day, hour, minute, second, nanosecond);
     }
 
-    /*!
-    \brief Append a UTCTimeOnly field to the message with millisecond precision.
-
-    No time zone or daylight savings time transformations are done to the time.
-
-    Fractional seconds will be written to the field, rounded to the millisecond.
-
-    \param tag FIX tag.
-    \param timeonly Time.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    template<typename Rep, typename Period>
-    void push_back_timeonly(int tag, std::chrono::duration<Rep,Period> timeonly) {
-        using namespace std::chrono;
-
-        push_back_timeonly(
-            tag,
-            duration_cast<hours>       (timeonly).count(),
-            duration_cast<minutes>     (timeonly %   hours(1)).count(),
-            duration_cast<seconds>     (timeonly % minutes(1)).count(),
-            duration_cast<milliseconds>(timeonly % seconds(1)).count()
-            );
+    /** \brief UTCTimestamp from raw signed epoch milliseconds. */
+    void push_back_timestamp_epoch_millis(int tag, std::int64_t epoch_millis) noexcept {
+        push_back_timestamp(tag,
+                            std::chrono::sys_time<std::chrono::milliseconds>{
+                                std::chrono::milliseconds{epoch_millis}});
     }
 
-    /*!
-    \brief Append a UTCTimeOnly field to the message with nanosecond precision.
-
-    No time zone or daylight savings time transformations are done to the time.
-
-    Fractional seconds will be written to the field, rounded to the nanosecond.
-
-    \param tag FIX tag.
-    \param timeonly Time.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    template<typename Rep, typename Period>
-    void push_back_timeonly_nano(int tag, std::chrono::duration<Rep,Period> timeonly) {
-        using namespace std::chrono;
-
-        push_back_timeonly_nano(
+    /** \brief UTCTimestamp from raw signed epoch nanoseconds. */
+    void push_back_timestamp_epoch_nanos(int tag, std::int64_t epoch_nanos) noexcept {
+        push_back_timestamp_nano(
             tag,
-            duration_cast<hours>      (timeonly).count(),
-            duration_cast<minutes>    (timeonly %   hours(1)).count(),
-            duration_cast<seconds>    (timeonly % minutes(1)).count(),
-            duration_cast<nanoseconds>(timeonly % seconds(1)).count()
-            );
+            std::chrono::sys_time<std::chrono::nanoseconds>{std::chrono::nanoseconds{epoch_nanos}});
     }
-//@}
-#endif
 
-
-    /*! \name Data Fields */
-//@{
-
-    /*!
-    \brief Append a data length field and a data field to the message.
-
-    Note that this method will append two fields to the message. The first field is an integer equal to
-    the content length of the second field. FIX does this so that the content of the second field may contain
-    Ascii NULL or SOH or other control characters.
-
-    High Frequency FIX Parser calculates the content length for you
-    and writes out both fields, you just have to provide both tags and pointers to the data.
-    For most of the data fields in FIX, it is true that tag_data = tag_data_length + 1, but we daren't assume that.
-
-    Example:
-    \code
-    hffix::message_writer r;
-    std::string data("Some data.");
-    r.push_back_data(hffix::tag::RawDataLength, hffix::tag::RawData, data.begin(), data.end());
-    \endcode
-
-    \param tag_data_length FIX tag for the data length field.
-    \param tag_data FIX tag for the data field.
-    \param begin Pointer to the beginning of the data.
-    \param end Pointer to after-the-end of the data.
-
-    \throw std::out_of_range When the remaining buffer size is too small.
-    */
-    void push_back_data(int tag_data_length, int tag_data, char const* begin, char const* end) {
-        next_ = details::itoa(tag_data_length, next_, buffer_end_);
-        if (next_ == buffer_end_) details::throw_range_error();
-        *next_++ = '=';
-        next_ = details::itoa(end - begin, next_, buffer_end_);
-        if (next_ == buffer_end_) details::throw_range_error();
-        *next_++ = '\x01';
-        next_ = details::itoa(tag_data, next_, buffer_end_);
-
-        if (buffer_end_ - next_ < (end - begin) + 2) {
-            details::throw_range_error();
+    void push_back_data(int tag_data_length, int tag_data, char const* begin, char const* end) noexcept {
+        if (error_)
+            return;
+        if (end < begin) {
+            error_ = true;
+            return;
         }
+        std::ptrdiff_t const dlen = end - begin;
+        std::ptrdiff_t const need = details::max_ascii_chars<int> + 1 +
+                                    details::max_ascii_chars<int> + 1 +
+                                    details::max_ascii_chars<int> + 1 + dlen + 1;
+        if (buffer_end_ - next_ < need) {
+            error_ = true;
+            return;
+        }
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag_data_length), next_);
         *next_++ = '=';
-        memcpy(next_, begin, end - begin);
-        next_ += end - begin;
+        next_ = details::itoa_unchecked(static_cast<int>(dlen), next_);
+        *next_++ = '\x01';
+        next_ = details::utoa_unchecked(static_cast<unsigned>(tag_data), next_);
+        *next_++ = '=';
+        std::memcpy(next_, begin, static_cast<std::size_t>(dlen));
+        next_ += dlen;
         *next_++ = '\x01';
     }
 
-
-//@}
 private:
-    static void itoa_padded(int x, char* b, char* e) {
-        while (e > b) {
-            *--e = '0' + (x % 10);
-            x /= 10;
-        }
-    }
-
     char* buffer_;
     char* buffer_end_;
     char* next_;
-    char* body_length_; // Pointer to the location at which the BodyLength should be written, once the length of the message is known. 6 chars, which allows for messagelength up to 999,999.
+    char* body_length_ = nullptr;
+    bool error_ = false;
 };
 
-class message_reader;
-class message_reader_const_iterator;
+/**
+ * \brief Build one FIX message via `body(writer)` and push_back_trailer. Returns
+ * `false` on overflow; `end_out` set to one past the last byte on success.
+ */
+template <class F>
+[[nodiscard]] inline bool try_write_message(std::span<char> buffer, char*& end_out, F body) noexcept {
+    message_writer w(buffer);
+    body(w);
+    if (!w.push_back_trailer())
+        return false;
+    end_out = w.message_end();
+    return true;
+}
 
-/*!
- * \brief FIX field value for hffix::message_reader.
+template <class F>
+[[nodiscard]] inline bool try_write_message(char* begin, char* end, char*& end_out, F body) noexcept {
+    return try_write_message(
+        std::span<char>(begin, static_cast<std::size_t>(end - begin)), end_out, std::move(body));
+}
+
+class basic_message_reader;
+class basic_message_reader_const_iterator;
+class basic_indexed_message;
+class basic_group_entry;
+class basic_group_iterator;
+class basic_group_view;
+
+namespace groups {
+/**
+ * \brief Compile-time mapping from a NoXxx count tag to its delimiter tag.
+ *
+ * Specialize via `HFFIX_REGISTER_GROUP(CountTag, FirstTag)`. Unknown counts
+ * yield `first_tag == 0` and trigger `static_assert` on `reader.group<CountTag>()`.
+ */
+template <int CountTag>
+struct group_def {
+    static constexpr int first_tag = 0;
+};
+}  // namespace groups
+
+#define HFFIX_REGISTER_GROUP(count_tag_name, first_tag_name)           \
+    namespace hffix {                                                  \
+    namespace groups {                                                 \
+    template <>                                                        \
+    struct group_def<::hffix::tag::count_tag_name> {                   \
+        static constexpr int first_tag = ::hffix::tag::first_tag_name; \
+    };                                                                 \
+    }                                                                  \
+    }                                                                  \
+    static_assert(true, "require trailing semicolon")
+
+/**
+ * \brief FIX field value for hffix::basic_message_reader.
  *
  * <h3>Usage</h3>
  *
  * This class is a range `begin(),end()` of pointers into
- * a `message_reader` buffer which delimit the value for one field.
+ * a `basic_message_reader` buffer which delimit the value for one field.
  *
  * FIX field values are an array of chars, and are usually ASCII.
  * Type conversion deserialization is provided by the `as_` family
@@ -1565,188 +1128,116 @@ class message_reader_const_iterator;
  * perform deserialization for a type, then you can deserialize the field value
  * yourself, by reading the string delimited by `begin(),end()`.
  *
- * For example, these two statements should be equivalent for a `field_value v`:
- *
- * \code
- * int i = v.as_int();
- * int i = boost::lexical_cast<int>(v.begin(), v.size());
- * \endcode
 */
 class field_value {
 public:
+    char const* begin() const { return begin_; }
 
-    /*! \brief Pointer to the beginning of the field value in the buffer. */
-    char const* begin() const {
-        return begin_;
-    }
+    char const* end() const { return end_; }
 
-    /*! \brief Pointer to past-the-end of the field value in the buffer. */
-    char const* end() const {
-        return end_;
-    }
+    /** \brief Size of the field value, in bytes. */
+    size_t size() const { return end_ - begin_; }
 
-    /*! \brief Size of the field value, in bytes. */
-    size_t size() const {
-        return end_ - begin_;
-    }
-
-
-    /*!
-    \brief True if the value of the field is equal to the C-string argument.
-    */
     inline friend bool operator==(field_value const& that, char const* cstring) {
         return !strncmp(that.begin(), cstring, that.size()) && !cstring[that.size()];
-        // TODO Is this correct? Maybe getting too fancy here trying to avoid call to strlen.
     }
 
-    /*!
-    \brief True if the value of the field is equal to the C-string argument.
-    */
     inline friend bool operator==(char const* cstring, field_value const& that) {
         return that == cstring;
     }
 
-    /*!
-    \brief True if the value of the field is not equal to the C-string argument.
-    */
     inline friend bool operator!=(field_value const& that, char const* cstring) {
         return !(that == cstring);
     }
 
-    /*!
-    \brief True if the value of the field is not equal to the C-string argument.
-    */
     inline friend bool operator!=(char const* cstring, field_value const& that) {
         return !(that == cstring);
     }
 
-    /*!
-    \brief True if the value of the field is equal to the string argument.
-    */
-    inline friend bool operator==(field_value const& that, std::string const& s) {
-        return that.size() == s.size() && !strncmp(that.begin(), s.data(), that.size());
-    }
-
-    /*!
-    \brief True if the value of the field is equal to the string argument.
-    */
-    inline friend bool operator==(std::string const& s, field_value const& that) {
-        return that == s;
-    }
-
-    /*!
-    \brief True if the value of the field is not equal to the string argument.
-    */
-    inline friend bool operator!=(field_value const& that, std::string const& s) {
-        return !(that == s);
-    }
-
-    /*!
-    \brief True if the value of the field is not equal to the string argument.
-    */
-    inline friend bool operator!=(std::string const& s, field_value const& that) {
-        return !(that == s);
-    }
-
-#if __cplusplus >= 201703L
-    /*!
-    \brief True if the value of the field is equal to the string_view argument.
-    */
     inline friend bool operator==(field_value const& that, std::string_view s) {
         return std::equal(that.begin(), that.end(), s.begin(), s.end());
     }
 
-    /*!
-    \brief True if the value of the field is equal to the string_view argument.
-    */
-    inline friend bool operator==(std::string_view s, field_value const& that) {
-        return that == s;
-    }
+    inline friend bool operator==(std::string_view s, field_value const& that) { return that == s; }
 
-    /*!
-    \brief True if the value of the field is not equal to the string_view argument.
-    */
     inline friend bool operator!=(field_value const& that, std::string_view s) {
         return !(that == s);
     }
 
-    /*!
-    \brief True if the value of the field is not equal to the string_view argument.
-    */
     inline friend bool operator!=(std::string_view s, field_value const& that) {
         return !(that == s);
     }
-#endif
 
-    /*!
-     * \brief Stream out the raw text value of the field.
-     */
     friend std::ostream& operator<<(std::ostream& os, field_value const& that) {
         return os.write(that.begin(), that.size());
     }
 
-    /*! \name String Conversion Methods */
-//@{
+    /** \name String Conversion Methods */
+    //@{
 
-    /*!
-     * \brief Ascii value as std::string.
-     *
-     * \warning This function will, of course, allocate memory if the string is larger than the short-string-optimization size. This is the only function in this library which may allocate memory on the free store. Instead of using this function, consider reading the field value with `begin()` and `end()`.
-     *
-     * \return An std::string that contains a copy of the ascii value of the field.
-     * \throw std::bad_alloc
-    */
-    std::string as_string() const {
-        return std::string(begin(), end());
-    }
-
-#if __cplusplus >= 201703L
-    /*!
-     * \brief Ascii value as std::string_view.
-     *
-     * \return An std::string_view that contains the ascii value of the field.
-    */
-    std::string_view as_string_view() const {
+    [[nodiscard]] std::string_view as_string_view() const {
         return std::string_view(begin(), size());
     }
-#endif
 
-    /*!
-     * \brief Ascii value as char.
+    /**
+     * \brief First byte of the field value. Reads `*begin()` unconditionally.
      *
-     * \return The first char of the ascii value of the field.
+     * \warning Undefined behavior when `size() == 0`. FIX char-type
+     * fields are always one byte by spec, so on conforming input from
+     * a validated reader this cannot fire; untrusted callers must
+     * check `size() > 0` first.
      */
-    char as_char() const {
-        return *begin();
-    }
+    [[nodiscard]] char as_char() const { return *begin(); }
 
-//@}
+    //@}
 
+    /** \name Decimal Float Conversion Methods */
+    //@{
 
-    /*! \name Decimal Float Conversion Methods */
-//@{
+    /**
+    \brief Non-validating ascii-to-decimal. Decimal float as
+    `mantissa * 10^exponent`, non-normalized, `exponent <= 0`.
 
-    /*!
-    \brief Ascii-to-decimal conversion.
+    \warning **Trusted-input only.** Behavior is undefined for any of
+    the following on the input range `[begin(), end())`:
 
-    Converts an ascii string to a decimal float, of the form \htmlonly mantissa&times;10<sup>exponent</sup>\endhtmlonly.
+    - any byte outside `'0'..'9'` other than a single leading `-` or a
+      single `.`,
+    - more than one `.`,
+    - an empty value (zero bytes),
+    - a digit count large enough that `Int_type` overflows; no
+      overflow detection is performed and the result silently wraps.
 
-    Non-normalized. The exponent will always be less than or equal to zero.
-    If the decimal float is an integer, the exponent will be zero.
+    Wire-untrusted values must use `try_as_decimal` instead. This
+    function exists for the hot path after the caller has externally
+    validated the byte range (e.g. from a fixed-format venue feed with
+    schema-checked fields).
 
-    \tparam Int_type Integer type for the mantissa and exponent.
-    \param[out] mantissa Reference to storage for the mantissa of the decimal float to be returned.
-    \param[out] exponent Reference to storage for the exponent of the decimal float to be returned.
+    \tparam Int_type Signed integer type for mantissa and exponent.
+    \param[out] mantissa Integer mantissa.
+    \param[out] exponent Decimal exponent, `<= 0`.
     */
-    template<typename Int_type> void as_decimal(Int_type& mantissa, Int_type& exponent) const {
+    template <typename Int_type>
+    void as_decimal_unchecked(Int_type& mantissa, Int_type& exponent) const {
         details::atod<Int_type>(begin(), end(), mantissa, exponent);
     }
-//@}
+
+    /**
+    \brief Validating ascii-to-decimal conversion. Rejects empty value,
+    multiple dots, stray '+', non-digit chars. No overflow detection.
+    Sets out-params only on success.
+    \return True on success, false otherwise.
+    */
+    template <typename Int_type>
+    [[nodiscard]] bool try_as_decimal(Int_type& mantissa, Int_type& exponent) const noexcept {
+        return details::try_atod<Int_type>(begin(), end(), mantissa, exponent);
+    }
+
+    //@}
 
 private:
     template <typename Int_type, bool Is_signed_integer>
-    struct as_int_selector {
-    };
+    struct as_int_selector {};
 
     template <typename Int_type>
     struct as_int_selector<Int_type, true> {
@@ -1763,60 +1254,84 @@ private:
     };
 
 public:
+    /** \name Integer Conversion Methods */
+    //@{
 
-    /*! \name Integer Conversion Methods */
-//@{
+    /**
+    \brief Non-validating ascii-to-integer.
 
-    /*!
-    \brief Ascii-to-integer conversion.
+    \warning **Trusted-input only.** Behavior is undefined for any of
+    the following on the input range `[begin(), end())`:
 
-    Parses ascii and returns an integer.
+    - any byte outside `'0'..'9'` other than a single leading `-` on a
+      signed `Int_type`,
+    - a stray `+` (no positive sign permitted),
+    - an empty value (zero bytes),
+    - a digit count large enough to overflow `Int_type`; no overflow
+      detection is performed and the result silently wraps.
 
-    \tparam Int_type The type of integer to be returned. May be an unsigned integer.
-    \return The ascii field value represented as an integer of type Int_type.
+    Wire-untrusted values must use `try_as_int` instead. This function
+    exists for the hot path after the caller has externally validated
+    the byte range. Marked `HFFIX_HOT` because it appears in
+    parser-inner-loop call sites (`CheckSum`, `BodyLength`,
+    `MsgSeqNum`, post-validated tag accumulators).
+
+    \tparam Int_type Signed or unsigned integer type.
+    \return The parsed value. Undefined for inputs that violate the
+    preconditions above.
     */
-    template<typename Int_type> Int_type as_int() const {
-        return as_int_selector<Int_type, std::numeric_limits<Int_type>::is_signed>::call_as_int(begin(), end());
+    template <typename Int_type>
+    [[nodiscard]] HFFIX_HOT Int_type as_int_unchecked() const {
+        return as_int_selector<Int_type, std::numeric_limits<Int_type>::is_signed>::call_as_int(
+            begin(), end());
     }
-//@}
 
-    /*! \name Date and Time Conversion Methods */
-//@{
+    /**
+    \brief Validating ascii-to-integer conversion.
 
+    Rejects an empty value, a stray '+', and any non-digit other than a
+    leading '-' on a signed Int_type. No overflow detection.
 
-    /*!
-    \brief Ascii-to-date conversion.
-
-    Parses ascii and returns a LocalMktDate or UTCDate.
-
-    \param[out] year Year.
-    \param[out] month Month.
-    \param[out] day Day.
-    \return True if successful and the out arguments were set.
+    \tparam Int_type Signed or unsigned integer type.
+    \param[out] out Set only if the parse succeeded.
+    \return True on success, false otherwise.
     */
-    bool as_date(
-        int& year,
-        int& month,
-        int& day
-    ) const {
+    template <typename Int_type>
+    [[nodiscard]] bool try_as_int(Int_type& out) const noexcept {
+        if constexpr (std::numeric_limits<Int_type>::is_signed)
+            return details::try_atoi<Int_type>(begin(), end(), out);
+        else
+            return details::try_atou<Int_type>(begin(), end(), out);
+    }
+
+    //@}
+
+    /** \name Date and Time Conversion Methods */
+    //@{
+
+    /**
+    \brief Parse a LocalMktDate or UTCDate `YYYYMMDD` field.
+    Out-params set only on success.
+    */
+    [[nodiscard]] bool as_date(int& year, int& month, int& day) const {
         return details::atodate(begin(), end(), year, month, day);
     }
 
+    /**
+    \brief Parse a MonthYear `YYYYMM` field.
 
-    /*!
-    \brief Ascii-to-month-year conversion.
+    Validates length only (6 bytes). The 6 bytes are then parsed with
+    the unchecked digit parser, so non-digit content yields undefined
+    output but cannot read past the field. Callers receiving values
+    from untrusted sources should additionally range-check
+    `month ∈ [1, 12]` and `year` against a venue-plausible band after
+    this returns `true`.
 
-    Parses ascii and returns a month-year.
-
-    \param[out] year Year.
-    \param[out] month Month.
-    \return True if successful and the out arguments were set.
+    \return `true` only if `size() == 6`; out-params unmodified on `false`.
     */
-    bool as_monthyear(
-        int& year,
-        int& month
-    ) const {
-        if (end() - begin() != 6) return false;
+    [[nodiscard]] bool as_monthyear(int& year, int& month) const {
+        if (end() - begin() != 6)
+            return false;
 
         year = details::atoi<int>(begin(), begin() + 4);
         month = details::atoi<int>(begin() + 4, begin() + 6);
@@ -1824,494 +1339,262 @@ public:
         return true;
     }
 
-
-    /*!
-    \brief Ascii-to-time conversion with millisecond precision.
-
-    Parses ascii and returns a time with millisecond precision.
-
-    \param[out] hour Hour.
-    \param[out] minute Minute.
-    \param[out] second Second.
-    \param[out] millisecond Millisecond.
-    \return True if successful and the out arguments were set.
+    /**
+    \brief Parse a UTCTimeOnly `HH:MM:SS[.sss]` field. Out-params set
+    only on success.
     */
-    bool as_timeonly(
-        int& hour,
-        int& minute,
-        int& second,
-        int& millisecond
-    ) const {
+    [[nodiscard]] bool as_timeonly(int& hour, int& minute, int& second, int& millisecond) const {
         return details::atotime(begin(), end(), hour, minute, second, millisecond);
     }
 
-    /*!
-    \brief Ascii-to-time conversion with nanosecond precision.
-
-    Parses ascii and returns a time with nanosecond precision.
-
-    \param[out] hour Hour.
-    \param[out] minute Minute.
-    \param[out] second Second.
-    \param[out] nanosecond Nanosecond.
-    \return True if successful and the out arguments were set.
+    /**
+    \brief Parse a UTCTimeOnly field with nanosecond precision
+    (`HH:MM:SS[.sss|.ssssss|.sssssssss]`). Out-params set only on
+    success.
     */
-    bool as_timeonly_nano(
-        int& hour,
-        int& minute,
-        int& second,
-        int& nanosecond
-    ) const {
+    [[nodiscard]] bool as_timeonly_nano(int& hour, int& minute, int& second, int& nanosecond) const {
         return details::atotime_nano(begin(), end(), hour, minute, second, nanosecond);
     }
 
-    /*!
-    \brief Ascii-to-timestamp conversion with millisecond precision.
-
-    Parses ascii and returns a timestamp with millisecond precision.
-
-    \param[out] year Year.
-    \param[out] month Month.
-    \param[out] day Day.
-    \param[out] hour Hour.
-    \param[out] minute Minute.
-    \param[out] second Second.
-    \param[out] millisecond Millisecond.
-    \return True if successful and the out arguments were set.
+    /**
+    \brief Parse a UTCTimestamp `YYYYMMDD-HH:MM:SS[.sss]` field.
+    Date-part length is checked via short-circuit `&&` after the time
+    part parses. Out-params set only on success.
     */
-    bool as_timestamp(
-        int& year,
-        int& month,
-        int& day,
-        int& hour,
-        int& minute,
-        int& second,
-        int& millisecond
-    ) const {
-        return
-            details::atotime(begin() + 9, end(), hour, minute, second, millisecond)
-            && details::atodate(begin(), begin() + 8, year, month, day); // take advantage of short-circuit && to check field length
+    [[nodiscard]] bool as_timestamp(
+        int& year, int& month, int& day, int& hour, int& minute, int& second, int& millisecond) const {
+        return details::atotime(begin() + 9, end(), hour, minute, second, millisecond) &&
+               details::atodate(begin(), begin() + 8, year, month, day);
     }
 
-    /*!
-    \brief Ascii-to-timestamp conversion with nanosecond precision.
-
-    Parses ascii and returns a timestamp with nanosecond precision.
-
-    \param[out] year Year.
-    \param[out] month Month.
-    \param[out] day Day.
-    \param[out] hour Hour.
-    \param[out] minute Minute.
-    \param[out] second Second.
-    \param[out] nanosecond Nanosecond.
-    \return True if successful and the out arguments were set.
+    /**
+    \brief Parse a UTCTimestamp field with nanosecond precision.
+    Date-part length is checked via short-circuit `&&` after the time
+    part parses. Out-params set only on success.
     */
-    bool as_timestamp_nano(
-        int& year,
-        int& month,
-        int& day,
-        int& hour,
-        int& minute,
-        int& second,
-        int& nanosecond
-    ) const {
-        return
-            details::atotime_nano(begin() + 9, end(), hour, minute, second, nanosecond)
-            && details::atodate(begin(), begin() + 8, year, month, day); // take advantage of short-circuit && to check field length
+    [[nodiscard]] bool as_timestamp_nano(
+        int& year, int& month, int& day, int& hour, int& minute, int& second, int& nanosecond) const {
+        return details::atotime_nano(begin() + 9, end(), hour, minute, second, nanosecond) &&
+               details::atodate(begin(), begin() + 8, year, month, day);
     }
 
-//@}
+    //@}
 
-#ifdef HFFIX_BOOST_DATETIME
-
-    /*! \name Boost Date and Time Conversion Methods */
-//@{
-
-    /*!
-     * \brief Ascii-to-date conversion.
-     *
-     * Parses ascii and returns a LocalMktDate or UTCDate.
-     *
-     * \return Date if parsing was successful, else `boost::posix_time::not_a_date_time`.
-     */
-    boost::gregorian::date as_date() const {
-        int year, month, day;
-        if (as_date(year, month, day)) {
-            try {
-                return boost::gregorian::date(year, month, day);
-            } catch(std::exception& ex) {
-                return boost::gregorian::date(boost::posix_time::not_a_date_time);
-            }
-        } else
-            return boost::gregorian::date(boost::posix_time::not_a_date_time);
+    /** \brief UTCTimestamp as signed epoch nanoseconds, or nullopt. */
+    [[nodiscard]] std::optional<std::int64_t> as_epoch_nanos() const noexcept {
+        std::chrono::sys_time<std::chrono::nanoseconds> tp;
+        if (!details::atotimepoint_nano(begin(), end(), tp))
+            return std::nullopt;
+        return tp.time_since_epoch().count();
     }
 
-    /*!
-     * \brief Ascii-to-time conversion with millisecond precision.
-     *
-     * Parses ascii and returns a time.
-     *
-     * \return Time if parsing was successful, else boost::posix_time::not_a_date_time.
-     */
-    boost::posix_time::time_duration as_timeonly() const {
+    /** \brief UTCTimestamp as signed epoch milliseconds, or nullopt. */
+    [[nodiscard]] std::optional<std::int64_t> as_epoch_millis() const noexcept {
+        std::chrono::sys_time<std::chrono::milliseconds> tp;
+        if (!details::atotimepoint(begin(), end(), tp))
+            return std::nullopt;
+        return tp.time_since_epoch().count();
+    }
+
+    /** \name std::chrono Date and Time Conversion Methods */
+    //@{
+
+    /**
+    \brief Parse a UTCTimestamp field into a `std::chrono::time_point`.
+    Uses Howard Hinnant's proleptic Gregorian algorithms (see
+    `http://howardhinnant.github.io/date_algorithms.html`).
+    */
+    template <typename Clock, typename Duration>
+    [[nodiscard]] bool as_timestamp(std::chrono::time_point<Clock, Duration>& tp) const {
+        return details::atotimepoint(begin(), end(), tp);
+    }
+
+    /**
+    \brief Parse a UTCTimestamp field with nanosecond precision into a
+    `std::chrono::time_point`.
+    */
+    template <typename Clock, typename Duration>
+    [[nodiscard]] bool as_timestamp_nano(std::chrono::time_point<Clock, Duration>& tp) const {
+        return details::atotimepoint_nano(begin(), end(), tp);
+    }
+
+    /**
+    \brief Parse a UTCTimeOnly field as a `std::chrono::duration`.
+    */
+    template <typename Rep, typename Period>
+    [[nodiscard]] bool as_timeonly(std::chrono::duration<Rep, Period>& dur) const {
         int hour, minute, second, millisecond;
-        if (as_timeonly(hour, minute, second, millisecond)) {
-            try {
-                return boost::posix_time::time_duration(hour, minute, second, boost::posix_time::time_duration::ticks_per_second() * millisecond / 1000);
-            } catch(std::exception& ex) {
-                return boost::posix_time::time_duration(boost::posix_time::not_a_date_time);
-            }
-        } else
-            return boost::posix_time::time_duration(boost::posix_time::not_a_date_time);
+        if (!as_timeonly(hour, minute, second, millisecond))
+            return false;
+        dur = std::chrono::hours(hour) + std::chrono::minutes(minute) +
+              std::chrono::seconds(second) + std::chrono::milliseconds(millisecond);
+        return true;
     }
 
-    /*!
-     * \brief Ascii-to-time conversion with nanosecond precision.
-     *
-     * Parses ascii and returns a time.
-     *
-     * \return Time if parsing was successful, else boost::posix_time::not_a_date_time.
-     */
-    boost::posix_time::time_duration as_timeonly_nano() const {
+    /**
+    \brief Parse a UTCTimeOnly field with nanosecond precision as a
+    `std::chrono::duration`.
+    */
+    template <typename Rep, typename Period>
+    [[nodiscard]] bool as_timeonly_nano(std::chrono::duration<Rep, Period>& dur) const {
         int hour, minute, second, nanosecond;
-        if (as_timeonly_nano(hour, minute, second, nanosecond)) {
-            try {
-                return boost::posix_time::time_duration(hour, minute, second, boost::posix_time::time_duration::ticks_per_second() * nanosecond / 1000000000L);
-            } catch(std::exception& ex) {
-                return boost::posix_time::time_duration(boost::posix_time::not_a_date_time);
-            }
-        } else
-            return boost::posix_time::time_duration(boost::posix_time::not_a_date_time);
-    }
-
-    /*!
-     * \brief Ascii-to-timestamp conversion with millisecond precision.
-     *
-     * Parses ascii and returns a timestamp with millisecond precision.
-     *
-     * \return Date and Time if parsing was successful, else boost::posix_time::not_a_date_time.
-    */
-    boost::posix_time::ptime as_timestamp() const {
-        int year, month, day, hour, minute, second, millisecond;
-
-        if (details::atotime(begin() + 9, end(), hour, minute, second, millisecond)
-                && details::atodate(begin(), begin() + 8, year, month, day)) {
-            try {
-                return boost::posix_time::ptime(
-                           boost::gregorian::date(year, month, day),
-                           boost::posix_time::time_duration(hour, minute, second, boost::posix_time::time_duration::ticks_per_second() * millisecond / 1000)
-                       );
-            } catch(std::exception& ex) {
-                return boost::posix_time::not_a_date_time;
-            }
-        } else
-            return boost::posix_time::not_a_date_time;
-    }
-
-    /*!
-     * \brief Ascii-to-timestamp conversion with nanosecond precision.
-     *
-     * Parses ascii and returns a timestamp with nanosecond precision.
-     *
-     * \return Date and Time if parsing was successful, else boost::posix_time::not_a_date_time.
-    */
-    boost::posix_time::ptime as_timestamp_nano() const {
-        int year, month, day, hour, minute, second, nanosecond;
-
-        if (details::atotime_nano(begin() + 9, end(), hour, minute, second, nanosecond)
-                && details::atodate(begin(), begin() + 8, year, month, day)) {
-            try {
-                return boost::posix_time::ptime(
-                           boost::gregorian::date(year, month, day),
-                           boost::posix_time::time_duration(hour, minute, second, boost::posix_time::time_duration::ticks_per_second() * nanosecond / 1000000000L)
-                       );
-            } catch(std::exception& ex) {
-                return boost::posix_time::not_a_date_time;
-            }
-        } else
-            return boost::posix_time::not_a_date_time;
-    }
-//@}
-
-
-#endif // HFFIX_BOOST_DATETIME
-
-#if __cplusplus >= 201103L
-    /*! \name std::chrono Date and Time Conversion Methods */
-//@{
-
-   /*!
-    * \brief Ascii-to-time-point conversion with millisecond precision.
-    *
-    * Parses ascii and returns a `std::chrono::time_point`.
-    *
-    * Uses algorithms from http://howardhinnant.github.io/date_algorithms.html ,
-    * which implement a proleptic Gregorian calendar. This will probably
-    * be superseded by C++20.
-    *
-    * \param[out] tp The return value `time_point`.
-    *
-    * \return True if parsing was successful and `tp` was set, else False.
-    */
-    template<typename Clock, typename Duration>
-    bool as_timestamp(std::chrono::time_point<Clock,Duration>& tp) const {
-        if (details::atotimepoint(begin(), end(), tp))
-            return true;
-        else
+        if (!as_timeonly_nano(hour, minute, second, nanosecond))
             return false;
+        dur = std::chrono::hours(hour) + std::chrono::minutes(minute) +
+              std::chrono::seconds(second) + std::chrono::nanoseconds(nanosecond);
+        return true;
     }
 
-   /*!
-    * \brief Ascii-to-time-point conversion with nanosecond precision.
-    *
-    * Parses ascii and returns a `std::chrono::time_point`.
-    *
-    * Uses algorithms from http://howardhinnant.github.io/date_algorithms.html ,
-    * which implement a proleptic Gregorian calendar. This will probably
-    * be superseded by C++20.
-    *
-    * \param[out] tp The return value `time_point`.
-    *
-    * \return True if parsing was successful and `tp` was set, else False.
-    */
-    template<typename Clock, typename Duration>
-    bool as_timestamp_nano(std::chrono::time_point<Clock,Duration>& tp) const {
-        if (details::atotimepoint_nano(begin(), end(), tp))
-            return true;
-        else
-            return false;
-    }
-
-   /*!
-    * \brief Ascii-to-time conversion.
-    *
-    * Parses ascii and returns a time duration or time-of-day.
-    *
-    * \param[out] dur The return value `duration`.
-    *
-    * \return True if parsing was successful and the return value was set,
-    * else False.
-    */
-    template<typename Rep, typename Period>
-    bool as_timeonly(std::chrono::duration<Rep,Period>& dur) const {
-        int hour, minute, second, millisecond;
-        if (as_timeonly(hour, minute, second, millisecond)) {
-            dur = std::chrono::hours(hour) +
-                  std::chrono::minutes(minute) +
-                  std::chrono::seconds(second) +
-                  std::chrono::milliseconds(millisecond);
-            return true;
-        }
-        else
-            return false;
-    }
-
-   /*!
-    * \brief Ascii-to-time conversion with nanosecond precision.
-    *
-    * Parses ascii and returns a time duration or time-of-day.
-    *
-    * \param[out] dur The return value `duration`.
-    *
-    * \return True if parsing was successful and the return value was set,
-    * else False.
-    */
-    template<typename Rep, typename Period>
-    bool as_timeonly_nano(std::chrono::duration<Rep,Period>& dur) const {
-        int hour, minute, second, nanosecond;
-        if (as_timeonly_nano(hour, minute, second, nanosecond)) {
-            dur = std::chrono::hours(hour) +
-                  std::chrono::minutes(minute) +
-                  std::chrono::seconds(second) +
-                  std::chrono::nanoseconds(nanosecond);
-            return true;
-        }
-        else
-            return false;
-    }
-//@}
-#endif
-
+    //@}
 
 private:
     friend class field;
-    friend class message_reader_const_iterator;
-    friend class message_reader;
-    char const* begin_;
-    char const* end_;
+    friend class basic_message_reader_const_iterator;
+    friend class basic_message_reader;
+    friend class basic_indexed_message;
+    char const* begin_ = nullptr;
+    char const* end_ = nullptr;
 };
 
-/*!
- * \brief A FIX field for hffix::message_reader, with tag and hffix::field_value.
+/**
+ * \brief A FIX field for hffix::basic_message_reader, with tag and hffix::field_value.
  *
- * This class is the hffix::message_reader::value_type for the hffix::message_reader Container.
+ * This class is the hffix::basic_message_reader::value_type for the hffix::basic_message_reader Container.
  */
 class field {
 public:
+    int tag() const { return tag_; }
 
-    /*! \brief Tag of the field. */
-    int tag() const {
-        return tag_;
-    }
+    field_value const& value() const { return value_; }
 
-    /*! \brief Weakly-typed value of the field. */
-    field_value const& value() const {
-        return value_;
-    }
-
-    /*! \brief Output stream operator. Output format is "[tag number]=[value]". */
+    /** \brief Stream as `tag=value`. */
     friend std::ostream& operator<<(std::ostream& os, field const& that) {
         os << that.tag_ << "=";
         return os.write(that.value_.begin(), that.value_.size());
     }
 
 private:
-    friend class message_reader_const_iterator;
-    friend class message_reader;
-    int tag_;
+    friend class basic_message_reader_const_iterator;
+    friend class basic_message_reader;
+    int tag_ = 0;
     field_value value_;
 };
 
-/*!
-\brief The iterator type for hffix::message_reader. Typedef'd as `hffix::message_reader::const_iterator`.
+/**
+\brief The iterator type for hffix::basic_message_reader.
 
-Satisfies the const Input Iterator Concept for an immutable hffix::message_reader container of fields.
+Satisfies the const Input Iterator Concept for an immutable hffix::basic_message_reader
+container of fields.
 */
-class message_reader_const_iterator {
-
+class basic_message_reader_const_iterator {
 public:
-
-    /*! /brief No-op construction of an invalid iterator.
-     *
-     * Like a null pointer, the invalid iterator may not be dereferenced.
+    /**
+     * \brief Default-constructs an invalid iterator. Not dereferenceable.
      */
-    message_reader_const_iterator() {}
-private:
+    basic_message_reader_const_iterator() {}
 
-    message_reader_const_iterator(message_reader const& container, char const* buffer) :
-        message_reader_(&container),
-        buffer_(buffer),
-        current_() {
-    }
+private:
+    basic_message_reader_const_iterator(basic_message_reader const&, char const* buffer)
+        : buffer_(buffer), message_end_(nullptr), current_() {}
 
 public:
-
-    //! \brief For std::iterator_traits
     typedef ::std::input_iterator_tag iterator_category;
-    //! \brief For std::iterator_traits
     typedef field value_type;
-    //! \brief For std::iterator_traits
     typedef std::ptrdiff_t difference_type;
-    //! \brief For std::iterator_traits
     typedef field* pointer;
-    //! \brief For std::iterator_traits
     typedef field& reference;
 
+    field const& operator*() const { return current_; }
 
-    /*!
-    \brief Returns a hffix::message_reader::const_reference to a field.
+    field const* operator->() const { return &current_; }
+
+    /**
+    \brief Pointer to the first byte of the current field on the wire.
     */
-    field const& operator*() const {
-        return current_;
-    }
+    char const* buffer_begin() const { return buffer_; }
 
-    /*!
-    \brief Returns a hffix::message_reader::const_pointer to a field.
-    */
-    field const* operator->() const {
-        return &current_;
-    }
-
-
-    //! \brief Equal
-    friend bool operator==(message_reader_const_iterator const& a, message_reader_const_iterator const& b) {
+    friend bool operator==(basic_message_reader_const_iterator const& a,
+                           basic_message_reader_const_iterator const& b) {
         return a.buffer_ == b.buffer_;
     }
 
-    //! \brief Not equal
-    friend bool operator!=(message_reader_const_iterator const& a, message_reader_const_iterator const& b) {
+    friend bool operator!=(basic_message_reader_const_iterator const& a,
+                           basic_message_reader_const_iterator const& b) {
         return a.buffer_ != b.buffer_;
     }
 
-    //! \brief Less-than
-    friend bool operator<(message_reader_const_iterator const& a, message_reader_const_iterator const& b) {
+    friend bool operator<(basic_message_reader_const_iterator const& a,
+                          basic_message_reader_const_iterator const& b) {
         return a.buffer_ < b.buffer_;
     }
 
-    //! \brief Greater-than
-    friend bool operator>(message_reader_const_iterator const& a, message_reader_const_iterator const& b) {
+    friend bool operator>(basic_message_reader_const_iterator const& a,
+                          basic_message_reader_const_iterator const& b) {
         return a.buffer_ > b.buffer_;
     }
 
-    //! \brief Less-than or equal
-    friend bool operator<=(message_reader_const_iterator const& a, message_reader_const_iterator const& b) {
+    friend bool operator<=(basic_message_reader_const_iterator const& a,
+                           basic_message_reader_const_iterator const& b) {
         return a.buffer_ <= b.buffer_;
     }
 
-    //! \brief Greater-than or equal
-    friend bool operator>=(message_reader_const_iterator const& a, message_reader_const_iterator const& b) {
+    friend bool operator>=(basic_message_reader_const_iterator const& a,
+                           basic_message_reader_const_iterator const& b) {
         return a.buffer_ >= b.buffer_;
     }
 
-    //! \brief Postfix increment
-    message_reader_const_iterator operator++(int) {
-        message_reader_const_iterator i(*this);
+    basic_message_reader_const_iterator operator++(int) {
+        basic_message_reader_const_iterator i(*this);
         ++(*this);
         return i;
     }
 
-    //! \brief Prefix increment
-    message_reader_const_iterator& operator++() {
+    basic_message_reader_const_iterator& operator++() {
         increment();
         return *this;
     }
 
-    /*!
-     * \brief Addition
-     *
-     * \param a Iterator to add to.
-     * \param addend Addend.
-     * \throw logic_error Throws if *addend < 0*
-     * \pre *addend >= 0*
+    /**
+     * \brief Advance by `addend` fields.
+     * \pre `addend >= 0`. Fires `HFFIX_ASSERT` otherwise.
      */
-    friend message_reader_const_iterator operator+(message_reader_const_iterator a, int addend) {
-        if (addend < 0) throw std::logic_error("message_reader::const_iterator is a Forward Iterator, so only positive addends are allowed.");
+    friend basic_message_reader_const_iterator operator+(basic_message_reader_const_iterator a,
+                                                         int addend) {
+        HFFIX_ASSERT(addend >= 0,
+                     "basic_message_reader::const_iterator is a Forward Iterator, so only "
+                     "positive addends are allowed.");
         for (int i = 0; i < addend; ++i)
             ++a;
 
         return a;
     }
 
-
-    //! \brief Addition
-    friend message_reader_const_iterator operator+(int addend, message_reader_const_iterator a) {
+    friend basic_message_reader_const_iterator operator+(int addend,
+                                                         basic_message_reader_const_iterator a) {
         return a + addend;
     }
 
 private:
-    friend class message_reader;
-    message_reader const* message_reader_; // pointer to the message_reader for this iterator
-    char const* buffer_; // pointer to the first character of the ascii tag number for the current_ field
+    friend class basic_message_reader;
+    char const* buffer_ = nullptr;
+    char const* message_end_ = nullptr;
     field current_;
 
     void increment();
 };
 
-
-/*!
+/**
  * \brief A predicate constructed with a FIX tag which returns true if the tag of the hffix::field passed to the predicate is equal.
  */
 struct tag_equal {
     tag_equal(int tag) : tag(tag) {}
+
     int tag;
-    bool operator()(field const& v) const {
-        return v.tag() == tag;
-    }
+
+    bool operator()(field const& v) const { return v.tag() == tag; }
 };
 
-
-/*!
+/**
  * \brief An algorithm similar to `std::find_if` for forward-searching over a range and finding items which match a predicate.
  *
  * Instead of searching from `begin` to `end`, searches from `i` to `end`, then searches from `begin` to `i`.
@@ -2319,7 +1602,7 @@ struct tag_equal {
  *
  * This expression:
  * \code
- * find_with_hint(begin, end, i, predicate)
+ * find_with_hint(begin, end, predicate, i)
  * \endcode
  * will behave exactly the same as this expression:
  * \code
@@ -2331,25 +1614,30 @@ struct tag_equal {
  *
  * Example usage:
  * \code
- * hffix::message_reader::const_iterator i = reader.begin();
+ * hffix::basic_message_reader::const_iterator i = reader.begin();
  *
  * if (hffix::find_with_hint(reader.begin(), reader.end(), hffix::tag_equal(hffix::tag::MsgSeqNum), i)
- *   int seqnum = i++->as_int<int>();
+ *   int seqnum = i++->as_int_unchecked<int>();
  *
  * if (hffix::find_with_hint(reader.begin(), reader.end(), hffix::tag_equal(hffix::tag::TargetCompID), i)
- *   std::string targetcompid = i++->as_string();
+ *   std::string_view targetcompid = i++->as_string_view();
  * \endcode
  *
- * See also the convenience method hffix::message_reader::find_with_hint.
+ * See also the convenience method hffix::basic_message_reader::find_with_hint.
  *
  * \param begin The beginning of the range to search.
  * \param end The end of the range to search.
  * \param predicate A predicate which provides function `bool operator() (ForwardIterator::value_type const &v) const`.
  * \param i If an item is found which satisfies `predicate`, then `i` is modified to point to the found item. Else `i` is unmodified.
  * \return True if an item was found which matched `predicate`, and `i` was modified to point to the found item.
+ *
+ * \note A past-the-end hint costs a full scan, not an early `false`.
  */
 template <typename ForwardIterator, typename UnaryPredicate>
-inline bool find_with_hint(ForwardIterator begin, ForwardIterator end, UnaryPredicate predicate, ForwardIterator & i) {
+[[nodiscard]] inline bool find_with_hint(ForwardIterator begin,
+                                         ForwardIterator end,
+                                         UnaryPredicate predicate,
+                                         ForwardIterator& i) {
     ForwardIterator j = std::find_if(i, end, predicate);
     if (j != end) {
         i = j;
@@ -2363,25 +1651,24 @@ inline bool find_with_hint(ForwardIterator begin, ForwardIterator end, UnaryPred
     return false;
 }
 
-
-/*!
+/**
  * \brief One FIX message for reading.
  *
- * An immutable Forward Container of FIX fields. Given a buffer containing a FIX message, the hffix::message_reader
+ * An immutable Forward Container of FIX fields. Given a buffer containing a FIX message, the hffix::basic_message_reader
  * will provide an Iterator for iterating over the fields in the message without modifying the buffer. The buffer
- * used to construct the hffix::message_reader must outlive the hffix::message_reader.
+ * used to construct the hffix::basic_message_reader must outlive the hffix::basic_message_reader.
  *
- * During construction, hffix::message_reader checks to make sure there is a complete,
+ * During construction, hffix::basic_message_reader checks to make sure there is a complete,
  * valid FIX message in the buffer. It looks only at the header and trailer transport fields in the message,
  * not at the content fields, so construction is O(1).
  *
- * If hffix::message_reader is complete and valid after construction,
- * hffix::message_reader::begin() returns an iterator that points to the MsgType field
+ * If hffix::basic_message_reader is complete and valid after construction,
+ * hffix::basic_message_reader::begin() returns an iterator that points to the MsgType field
  * in the FIX Standard Message Header, and
- * hffix::message_reader::end() returns an iterator that points to the CheckSum field in the
+ * hffix::basic_message_reader::end() returns an iterator that points to the CheckSum field in the
  * FIX Standard Message Trailer.
  *
- * The hffix::message_reader will only iterate over content fields of the message, and will skip over all of the framing transport fields
+ * The hffix::basic_message_reader will only iterate over content fields of the message, and will skip over all of the framing transport fields
  *  that are mixed in with the content fields in FIX. Here is the list of skipped fields which will not appear when iterating over the fields of the message:
  *
  * - BeginString
@@ -2391,124 +1678,89 @@ inline bool find_with_hint(ForwardIterator begin, ForwardIterator end, UnaryPred
  *
  * Fields of binary data type are content fields, and will be iterated over like any other field.
  * The special FIX binary data length framing fields will be skipped, but the length of the binary data
- * is accessible from the hffix::message_reader::value_type::value().size() of the content field.
+ * is accessible from the hffix::basic_message_reader::value_type::value().size() of the content field.
 */
-class message_reader {
-
+class basic_message_reader {
 public:
-
     typedef field value_type;
     typedef field const& const_reference;
-    typedef message_reader_const_iterator const_iterator;
+    typedef basic_message_reader_const_iterator const_iterator;
     typedef field const* const_pointer;
     typedef size_t size_type;
 
-    /*!
-    \brief Construct by buffer size.
-    \param buffer Pointer to the buffer to be read.
-    \param size Number of bytes in the buffer to be read.
+    /**
+    \brief Construct from a contiguous byte span.
+    \param buffer Span over the buffer to be read.
     */
-    message_reader(char const* buffer, size_t size) :
-        buffer_(buffer),
-        buffer_end_(buffer + size),
-        begin_(*this, 0),
-        end_(*this, 0),
-        is_complete_(false),
-        is_valid_(true) {
+    explicit basic_message_reader(std::span<char const> buffer)
+        : end_(*this, 0),
+          buffer_(buffer.data()),
+          buffer_end_(buffer.data() + buffer.size()),
+          is_complete_(false),
+          is_valid_(true),
+          begin_(*this, 0) {
         init();
     }
 
-    /*!
-    \brief Construct by buffer begin and end.
-    \param begin Pointer to the buffer to be read.
-    \param end Pointer to past-the-end of the buffer to be read.
+    /**
+    \brief Construct by buffer pointer and size.
     */
-    message_reader(char const* begin, char const* end) :
-        buffer_(begin),
-        buffer_end_(end),
-        begin_(*this, 0),
-        end_(*this, 0),
-        is_complete_(false),
-        is_valid_(true) {
-        init();
+    basic_message_reader(char const* buffer, std::size_t size)
+        : basic_message_reader(std::span<char const>(buffer, size)) {}
+
+    /**
+    \brief Construct by buffer begin and end pointers.
+    */
+    basic_message_reader(char const* begin, char const* end)
+        : basic_message_reader(std::span<char const>(begin, static_cast<std::size_t>(end - begin))) {
     }
 
-    /*!
-     * \brief Copy constructor. The hffix::message_reader is immutable, so copying it is fine.
-     */
-    message_reader(message_reader const& that) :
-        buffer_(that.buffer_),
-        buffer_end_(that.buffer_end_),
-        begin_(*this, 0),
-        end_(*this, 0),
-        is_complete_(that.is_complete_),
-        is_valid_(that.is_valid_) {
-        init();
-    }
+    basic_message_reader(basic_message_reader const&) noexcept = default;
+    basic_message_reader& operator=(basic_message_reader const&) noexcept = default;
+    basic_message_reader(basic_message_reader&&) noexcept = default;
+    basic_message_reader& operator=(basic_message_reader&&) noexcept = default;
 
-    /*!
-     * \brief Copy assignment operator. The hffix::message_reader is immutable, so copying it is fine.
-     */
-    message_reader& operator = (const message_reader& that)
-    {
-        buffer_= that.buffer_;
-        buffer_end_ = that.buffer_end_;
-        // This can't be the default assignment operator because begin_ and end_ are const_iterators which
-        // point back to 'this'. If we copy them as is they will point back to the previous 'that'.
-        begin_ = const_iterator(*this, 0);
-        end_ = const_iterator(*this, 0);
-        is_complete_ = that.is_complete_;
-        is_valid_ = that.is_valid_;
-        init();
-        return *this;
-    }
-
-    /*!
-     * \brief Construct a message_reader from a message_writer. Equivalent to
+    /**
+     * \brief Construct a basic_message_reader from a message_writer. Equivalent to
      * \code
      * hffix::message_writer w;
-     * hffix::message_reader r(w.message_begin(), w.message_end());
+     * hffix::basic_message_reader r(w.message_begin(), w.message_end());
      * \endcode
      */
-    message_reader(message_writer const& that) :
-        buffer_(that.message_begin()),
-        buffer_end_(that.message_end()),
-        begin_(*this, 0),
-        end_(*this, 0),
-        is_complete_(false),
-        is_valid_(true) {
+    basic_message_reader(message_writer const& that)
+        : end_(*this, 0),
+          buffer_(that.message_begin()),
+          buffer_end_(that.message_end()),
+          is_complete_(false),
+          is_valid_(true),
+          begin_(*this, 0) {
         init();
     }
 
-    /*!
+    /**
     \brief Construct on an array reference to a buffer.
     \tparam N The size of the array.
     \param buffer An array reference. The reader will read from the entire array of length _N_.
     */
-    template<size_t N>
-    message_reader(const char(&buffer)[N]) :
-        buffer_(buffer),
-        buffer_end_(&(buffer[N])),
-        begin_(*this, 0),
-        end_(*this, 0),
-        is_complete_(false),
-        is_valid_(true) {
+    template <size_t N>
+    basic_message_reader(char const (&buffer)[N])
+        : end_(*this, 0),
+          buffer_(buffer),
+          buffer_end_(&(buffer[N])),
+          is_complete_(false),
+          is_valid_(true),
+          begin_(*this, 0) {
         init();
     }
 
-    /*!
-     * \brief Owns no resources, so destruction is no-op.
-     */
-    ~message_reader() {
-    }
+    ~basic_message_reader() {}
 
-    /*!
+    /**
      * \brief True if the buffer contains a complete FIX message.
      */
-    bool is_complete() const {
-        return is_complete_;
-    }
-    /*!
+    [[nodiscard]] bool is_complete() const { return is_complete_; }
+
+    /**
      * \brief True if the message is valid.
      *
      * A valid message must meet these criteria.
@@ -2523,131 +1775,114 @@ public:
      * valid body length and checksum field"
      *
     */
-    bool is_valid() const {
-        return is_valid_;
-    }
+    [[nodiscard]] bool is_valid() const { return is_valid_; }
 
-
-    /*!
-     * \brief Returns a new message_reader for the next FIX message in the buffer.
+    /**
+     * \brief Returns a new basic_message_reader for the next FIX message in the buffer.
      *
      * If this message is_valid() and is_complete(), assume that the next message comes immediately
-     * after this one and return a new message_reader constructed at this->message_end().
+     * after this one and return a new basic_message_reader constructed at this->message_end().
      *
      * If this message `!`is_valid(), will search the remainder of the buffer
      * for the text "8=FIX", to see if there might be a complete or partial valid message
-     * anywhere else in the remainder of the buffer, will return a new message_reader constructed at that location.
+     * anywhere else in the remainder of the buffer, will return a new basic_message_reader constructed at that location.
      *
-     * \throw std::logic_error If this message `!`is_complete().
+     * \pre `is_complete()`. Fires `HFFIX_ASSERT` otherwise.
      */
-    message_reader next_message_reader() const {
-        if (!is_complete_) {
-            throw std::logic_error("Can't call next_message_reader on an incomplete message.");
-        }
+    basic_message_reader next_message_reader() const {
+        HFFIX_ASSERT(is_complete_, "Can't call next_message_reader on an incomplete message.");
 
-        if (!is_valid_) { // this message isn't valid, so we have to try to search for the beginning of the next message.
+        if (!is_valid_) {  // resync by scanning for the next "8=FIX"
+            // Guard against `buffer_end_ - 10` forming a pointer below `buffer_`
+            // (pointer arithmetic UB) when the buffer is shorter than 10 bytes.
+            if (buffer_end_ - buffer_ < 10) {
+                return basic_message_reader(buffer_end_, buffer_end_);
+            }
             char const* b = buffer_ + 1;
-            while(b < buffer_end_ - 10) {
+            while (b < buffer_end_ - 10) {
                 if (!std::memcmp(b, "8=FIX", 5))
                     break;
                 ++b;
             }
-            return message_reader(b, buffer_end_);
+            return basic_message_reader(b, buffer_end_);
         }
 
-        return message_reader(end_.current_.value_.end_ + 1, buffer_end_);
+        char const* next = end_.current_.value_.end_ + 1;
+        HFFIX_PREFETCH(next + 64);
+        return basic_message_reader(next, buffer_end_);
     }
 
-   /*!
-    \brief Calulate the checksum for this message.
+    /**
+    \brief Calculate the checksum for this message.
 
-    Note that the *hffix* library never does this calculation implicitly
-    for messages read. For checksum calculation this function must be
-    explicitly called.
-
-    The only thing to do after calculating the checksum for this message
-    is to compare it to the CheckSum field that the message reports for
-    itself, like so:
+    Reader never computes the checksum implicitly. Compare against the
+    CheckSum field reported by the message:
 
     \code
-    hffix::message_reader r;
-    if (r.calculate_check_sum() == r.check_sum()->value()as_int<unsigned char>()) {}
+    if (r.calculate_check_sum() == r.check_sum()->value().as_int_unchecked<unsigned char>()) {}
     \endcode
 
-    \return The calculated checksum.
-
-    \throw std::logic_error if called on an invalid message. Check for `is_valid()` before calling.
+    \pre `is_valid()`. Fires `HFFIX_ASSERT` otherwise.
     */
-    unsigned char calculate_check_sum() {
-        // return iterator for beginning of nonmutable sequence
-        if (!is_valid_) throw std::logic_error("hffix Cannot calculate checksum for an invalid message.");
-        return std::accumulate(buffer_, end_.buffer_, (unsigned char)(0));
+    [[nodiscard]] unsigned char calculate_check_sum() const noexcept {
+        HFFIX_ASSERT(is_valid_, "hffix Cannot calculate checksum for an invalid message.");
+        return details::checksum_bytes(buffer_, end_.buffer_);
     }
 
-    /*! \name Field Access */
-//@{
-    /*!
-    \brief An iterator to the MsgType field in the FIX message. Same as hffix::message_reader::message_type().
-    \throw std::logic_error if called on an invalid message. This exception is preventable by program logic. You should always check if a message is_valid() before reading.
+    /** \name Field Access */
+    //@{
+    /**
+    \brief An iterator to the MsgType field in the FIX message. Same as hffix::basic_message_reader::message_type().
+    \pre `is_valid()`. Fires `HFFIX_ASSERT` otherwise.
     */
     const_iterator begin() const {
-        // return iterator for beginning of nonmutable sequence
-        if (!is_valid_) throw std::logic_error("hffix Cannot return iterator for an invalid message.");
+        HFFIX_ASSERT(is_valid_, "hffix Cannot return iterator for an invalid message.");
         return begin_;
     }
 
-    /*!
-    \brief An iterator to the CheckSum field in the FIX message. Same as hffix::message_reader::check_sum().
-    \throw std::logic_error if called on an invalid message. This exception is preventable by program logic. You should always check if a message is_valid() before reading.
+    /**
+    \brief An iterator to the CheckSum field in the FIX message. Same as hffix::basic_message_reader::check_sum().
+    \pre `is_valid()`. Fires `HFFIX_ASSERT` otherwise.
     */
     const_iterator end() const {
-        // return iterator for end of nonmutable sequence
-        if (!is_valid_) throw std::logic_error("hffix Cannot return iterator for an invalid message.");
+        HFFIX_ASSERT(is_valid_, "hffix Cannot return iterator for an invalid message.");
         return end_;
     }
 
-    /*!
-    \brief An iterator to the MsgType field in the FIX message. Same as hffix::message_reader::begin().
-    \throw std::logic_error if called on an invalid message. This exception is preventable by program logic. You should always check if a message is_valid() before reading.
+    /**
+    \brief An iterator to the MsgType field in the FIX message. Same as hffix::basic_message_reader::begin().
+    \pre `is_valid()`. Fires `HFFIX_ASSERT` otherwise.
     */
     const_iterator message_type() const {
-        // return iterator for beginning of nonmutable sequence
-        if (!is_valid_) throw std::logic_error("hffix Cannot return iterator for an invalid message.");
+        HFFIX_ASSERT(is_valid_, "hffix Cannot return iterator for an invalid message.");
         return begin_;
     }
 
-    /*!
-    \brief An iterator to the CheckSum field in the FIX message. Same as hffix::message_reader::end().
-    \throw std::logic_error if called on an invalid message. This exception is preventable by program logic. You should always check if a message is_valid() before reading.
+    /**
+    \brief An iterator to the CheckSum field in the FIX message. Same as hffix::basic_message_reader::end().
+    \pre `is_valid()`. Fires `HFFIX_ASSERT` otherwise.
     */
     const_iterator check_sum() const {
-        // return iterator for end of nonmutable sequence
-        if (!is_valid_) throw std::logic_error("hffix Cannot return iterator for an invalid message.");
+        HFFIX_ASSERT(is_valid_, "hffix Cannot return iterator for an invalid message.");
         return end_;
     }
 
-    /*!
-     * \brief Returns the FIX version prefix BeginString field value begin pointer. (Example: "FIX.4.4")
+    /**
+     * \brief Returns the FIX version prefix BeginString field value begin pointer. (Example: "FIXT.1.1")
      */
-    char const* prefix_begin() const {
-        return buffer_ + 2;
-    }
+    char const* prefix_begin() const { return buffer_ + 2; }
 
-    /*!
+    /**
      * \brief Returns the FIX version prefix BeginString field value end pointer.
      */
-    char const* prefix_end() const {
-        return prefix_end_;
-    }
+    char const* prefix_end() const { return prefix_end_; }
 
-    /*!
-     * \brief Returns the FIX version prefix BeginString field value size. (Example: returns 7 for "FIX.4.4")
+    /**
+     * \brief Returns the FIX version prefix BeginString field value size. (Example: returns 8 for "FIXT.1.1")
      */
-    size_t prefix_size() const {
-        return prefix_end_ - buffer_ - 2;
-    }
+    size_t prefix_size() const { return prefix_end_ - buffer_ - 2; }
 
-    /*!
+    /**
      * \brief Convenient synonym for `hffix::find_with_hint(reader.begin(), reader.end(), hffix::tag_equal(tag), i)`.
      *
      * Similar to `std::find_if`. See `hffix::find_with_hint` for details.
@@ -2658,85 +1893,104 @@ public:
      *
      * Example usage:
      * \code
-     * hffix::message_reader::const_iterator i = reader.begin();
+     * hffix::basic_message_reader::const_iterator i = reader.begin();
      *
      * if (reader.find_with_hint(MsgSeqNum, i))
-     *   int seqnum = i++->as_int<int>();
+     *   int seqnum = i++->as_int_unchecked<int>();
      *
      * if (reader.find_with_hint(TargetCompID, i))
-     *   std::string targetcompid = i++->as_string();
+     *   std::string_view targetcompid = i++->as_string_view();
      * \endcode
      */
-    bool find_with_hint(int tag, const_iterator& i) const {
+    [[nodiscard]] inline bool find_with_hint(int tag, const_iterator& i) const {
         return hffix::find_with_hint(begin(), end(), tag_equal(tag), i);
     }
 
-//@}
+    /**
+     * \brief Return a `basic_group_view` over a FIX repeating group.
+     *
+     * \param count_tag The NoXxx tag that introduces the group.
+     * \param first_tag_in_group Delimiter tag (first field of each entry),
+     * supplied by the caller from the FIX dictionary.
+     *
+     * Empty view if `count_tag` is absent or the group is empty. Call
+     * `group()` on a `basic_group_entry` for nested groups.
+     */
+    basic_group_view group(int count_tag, int first_tag_in_group) const;
 
+    /**
+     * \brief Compile-time dispatch over a registered FIX group.
+     *
+     * Delimiter looked up from `hffix::groups::group_def<CountTag>`. All
+     * FIX 5.0 SP2 + FIXT 1.1 groups are pre-registered in the generated
+     * `hffix_groups.hpp`; extend with `HFFIX_REGISTER_GROUP(...)`.
+     */
+    template <int CountTag>
+    basic_group_view group() const;
 
-    /*! \name Buffer Access */
-//@{
-    /*!
+    //@}
+
+    /** \name Buffer Access */
+    //@{
+    /**
     \brief A pointer to the begining of the buffer.
 
     buffer_begin() == message_begin()
     */
-    char const* buffer_begin() const {
-        return buffer_;
-    }
-    /*!
+    char const* buffer_begin() const { return buffer_; }
+
+    /**
     \brief A pointer to past-the-end of the buffer.
     */
-    char const* buffer_end() const {
-        return buffer_end_;
-    }
+    char const* buffer_end() const { return buffer_end_; }
 
-    /*!
+    /**
     \brief The size of the buffer in bytes.
     */
-    size_t buffer_size() const {
-        return buffer_end_ - buffer_;
-    }
+    size_t buffer_size() const { return buffer_end_ - buffer_; }
 
-    /*!
+    /**
     \brief A pointer to the beginning of the FIX message in the buffer.
 
      buffer_begin() == message_begin()
-
-    \throw std::logic_error if called on an invalid message. This exception is preventable by program logic. You should always check if a message is_valid() before reading.
     */
-    char const* message_begin() const {
-        return buffer_;
-    }
-    /*!
+    char const* message_begin() const { return buffer_; }
+
+    /**
     \brief A pointer to past-the-end of the FIX message in the buffer.
-    \throw std::logic_error if called on an invalid message. This exception is preventable by program logic. You should always check if a message is_valid() before reading.
+    \pre `is_valid()`. Fires `HFFIX_ASSERT` otherwise.
     */
     char const* message_end() const {
-        if (!is_valid_) throw std::logic_error("hffix Cannot determine size of an invalid message.");
+        HFFIX_ASSERT(is_valid_, "hffix Cannot determine size of an invalid message.");
         return end_.current_.value_.end_ + 1;
     }
 
-    /*!
+    /**
     \brief The entire size of the FIX message in bytes.
-    \throw std::logic_error if called on an invalid message. This exception is preventable by program logic. You should always check if a message is_valid() before reading.
+    \pre `is_valid()`. Fires `HFFIX_ASSERT` otherwise.
     */
     size_t message_size() const {
-        if (!is_valid_) throw std::logic_error("hffix Cannot determine size of an invalid message.");
+        HFFIX_ASSERT(is_valid_, "hffix Cannot determine size of an invalid message.");
         return end_.current_.value_.end_ - buffer_ + 1;
     }
 
-//@}
+    //@}
 
 private:
-    friend class message_reader_const_iterator;
+    friend class basic_message_reader_const_iterator;
 
     void init() {
+        // Need at least 9 bytes before forming `buffer_ + 9`; otherwise the pointer
+        // arithmetic itself is UB per [expr.add]/4.
+        if (buffer_end_ - buffer_ < 9) {
+            is_complete_ = false;
+            return;
+        }
+        // BeginString length varies ("8=FIX.4.4", "8=FIXT.1.1", ...). Skip
+        // the shortest possible prefix and then scan to the first SOH.
+        char const* b = buffer_ + 9;
 
-        // Skip the version prefix string "8=FIX.4.2" or "8=FIXT.1.1", et cetera.
-        char const* b = buffer_ + 9; // look for the first '\x01'
-
-        while(true) {
+        while (true) {
             if (b >= buffer_end_) {
                 is_complete_ = false;
                 return;
@@ -2756,26 +2010,28 @@ private:
             is_complete_ = false;
             return;
         }
-        if (b[1] != '9') { // next field must be tag 9 BodyLength
+        // Spec: BeginString must be followed by BodyLength (tag 9).
+        if (b[1] != '9') {
             invalid();
             return;
         }
-        b += 3; // skip the " 9=" for tag 9 BodyLength
+        b += 3;  // past "\x01 9="
 
-        size_t bodylength(0); // the value of tag 9 BodyLength
+        size_t bodylength(0);
 
-        while(true) {
+        while (true) {
             if (b >= buffer_end_) {
                 is_complete_ = false;
                 return;
             }
-            if (*b == '\x01') break;
-            if (*b < '0' || *b > '9') { // this is the only time we need to check for numeric ascii.
+            if (*b == '\x01')
+                break;
+            if (*b < '0' || *b > '9') {
                 invalid();
                 return;
             }
             bodylength *= 10;
-            bodylength += *b++ - '0'; // we know that 0 <= (*b - '0') <= 9, so rvalue will be positive.
+            bodylength += *b++ - '0';
         }
 
         ++b;
@@ -2784,8 +2040,16 @@ private:
             return;
         }
 
-        if (*b != '3' || b[1] != '5') { // next field must be tag 35 MsgType
+        // Spec: BodyLength must be followed by MsgType (tag 35).
+        if (*b != '3' || b[1] != '5') {
             invalid();
+            return;
+        }
+
+        // Reject bodylength large enough to overflow pointer arithmetic on `b + bodylength`.
+        // If bodylength would push past buffer_end_, the frame is incomplete (or truncated).
+        if (bodylength > static_cast<std::size_t>(buffer_end_ - b)) {
+            is_complete_ = false;
             return;
         }
 
@@ -2796,150 +2060,379 @@ private:
             return;
         }
 
-        if (*(checksum - 1) != '\x01') { // check for SOH before the checksum.
-                                         // this guarantees that at least
-                                         // there is one SOH in the message
-                                         // which will prevent us from
-                                         // falling off of the end of
-                                         // a malformed message while
-                                         // iterating.
+        // SOH before checksum bounds iteration against a malformed message.
+        if (*(checksum - 1) != '\x01') {
             invalid();
             return;
         }
 
-        if (*(checksum + 6) != '\x01') { // check for trailing SOH
+        if (*(checksum + 6) != '\x01') {
             invalid();
             return;
         }
 
         begin_.buffer_ = b;
-        begin_.current_.tag_ = 35; // MsgType
+        begin_.current_.tag_ = 35;
         b += 3;
         begin_.current_.value_.begin_ = b;
-        while(*++b != '\x01') {
-            if (b >= checksum) {
-                invalid();
-                return;
-            }
+        char const* msgtype_end = ::hffix::details::find_soh(b, checksum);
+        if (msgtype_end >= checksum) {
+            invalid();
+            return;
         }
-        begin_.current_.value_.end_ = b;
+        begin_.current_.value_.end_ = msgtype_end;
+        b = msgtype_end;
 
         end_.buffer_ = checksum;
-        end_.current_.tag_ = 10; //CheckSum
+        end_.current_.tag_ = 10;
         end_.current_.value_.begin_ = checksum + 3;
         end_.current_.value_.end_ = checksum + 6;
+
+        char const* message_end = checksum + 7;
+        begin_.message_end_ = message_end;
+        end_.message_end_ = message_end;
 
         is_complete_ = true;
     }
 
+    const_iterator end_;
     char const* buffer_;
     char const* buffer_end_;
-    const_iterator begin_;
-    const_iterator end_;
     bool is_complete_;
     bool is_valid_;
-    char const* prefix_end_; // Points after the 8=FIX... Prefix field.
+    const_iterator begin_;
+    char const* prefix_end_;
 
     void invalid() {
-        is_complete_ = true; // invalid messages are considered complete, for use of the message_reader::operator++()
+        is_complete_ = true;  // lets next_message_reader() resync past this frame
         is_valid_ = false;
     }
 };
 
+/**
+ * \brief One entry of a FIX repeating group. Half-open iterator range over
+ * the entry's fields; use `find_with_hint`/`begin`/`end` or pass to
+ * `hffix::build_field_index`.
+ */
+class basic_group_entry {
+public:
+    using const_iterator = basic_message_reader_const_iterator;
 
-/*! @cond EXCLUDE */
+    const_iterator begin() const noexcept { return begin_; }
+
+    const_iterator end() const noexcept { return end_; }
+
+    bool empty() const noexcept { return begin_ == end_; }
+
+    [[nodiscard]] inline bool find_with_hint(int tag, const_iterator& it) const {
+        return hffix::find_with_hint(begin_, end_, tag_equal(tag), it);
+    }
+
+    /** \brief Nested group lookup within this entry. */
+    basic_group_view group(int count_tag, int first_tag_in_group) const;
+
+    /**
+     * \brief Compile-time dispatch via `groups::group_def<CountTag>`.
+     * `static_assert` if unregistered.
+     */
+    template <int CountTag>
+    basic_group_view group() const;
+
+private:
+    friend class basic_group_iterator;
+    friend class basic_group_view;
+
+    basic_group_entry(const_iterator b, const_iterator e) noexcept : begin_(b), end_(e) {}
+
+    const_iterator begin_;
+    const_iterator end_;
+};
+
+/**
+ * \brief Forward iterator over `basic_group_entry` values in a group.
+ */
+class basic_group_iterator {
+public:
+    using const_iterator = basic_message_reader_const_iterator;
+    using value_type = basic_group_entry;
+    using reference = value_type;
+    using difference_type = std::ptrdiff_t;
+    using iterator_category = std::forward_iterator_tag;
+
+    value_type operator*() const noexcept { return {entry_begin_, entry_end_}; }
+
+    basic_group_iterator& operator++() noexcept {
+        if (remaining_ > 0)
+            --remaining_;
+        if (remaining_ == 0 || entry_end_ == group_end_) {
+            entry_begin_ = group_end_;
+            entry_end_ = group_end_;
+            remaining_ = 0;
+        } else {
+            entry_begin_ = entry_end_;
+            compute_entry_end();
+        }
+        return *this;
+    }
+
+    bool operator==(basic_group_iterator const& o) const noexcept {
+        return entry_begin_ == o.entry_begin_ && remaining_ == o.remaining_;
+    }
+
+    bool operator!=(basic_group_iterator const& o) const noexcept { return !(*this == o); }
+
+private:
+    friend class basic_group_view;
+
+    basic_group_iterator(const_iterator entry_begin,
+                         const_iterator group_end,
+                         int delimiter,
+                         std::size_t remaining) noexcept
+        : entry_begin_(entry_begin),
+          entry_end_(entry_begin),
+          group_end_(group_end),
+          delimiter_(delimiter),
+          remaining_(remaining) {
+        if (remaining_ == 0 || entry_begin_ == group_end_) {
+            entry_begin_ = group_end_;
+            entry_end_ = group_end_;
+            remaining_ = 0;
+        } else {
+            compute_entry_end();
+        }
+    }
+
+    void compute_entry_end() noexcept {
+        entry_end_ = entry_begin_;
+        ++entry_end_;
+        while (entry_end_ != group_end_ && entry_end_->tag() != delimiter_) {
+            ++entry_end_;
+        }
+    }
+
+    const_iterator entry_begin_;
+    const_iterator entry_end_;
+    const_iterator group_end_;
+    int delimiter_;
+    std::size_t remaining_;
+};
+
+/**
+ * \brief View over a FIX repeating group. Iterates `basic_group_entry`.
+ * `size()` is the declared NoXxx count; actual iteration may be shorter
+ * if the message is truncated.
+ */
+class basic_group_view {
+public:
+    using iterator = basic_group_iterator;
+    using const_iterator = iterator;
+
+    iterator begin() const noexcept {
+        auto it = view_begin_;
+        while (it != view_end_ && it->tag() != delimiter_)
+            ++it;
+        return iterator(it, view_end_, delimiter_, count_);
+    }
+
+    iterator end() const noexcept { return iterator(view_end_, view_end_, delimiter_, 0); }
+
+    std::size_t size() const noexcept { return count_; }
+
+    bool empty() const noexcept { return count_ == 0; }
+
+private:
+    friend class basic_message_reader;
+    friend class basic_group_entry;
+
+    using const_msg_iterator = basic_message_reader_const_iterator;
+
+    basic_group_view(const_msg_iterator view_begin,
+                     const_msg_iterator view_end,
+                     std::size_t count,
+                     int delimiter) noexcept
+        : view_begin_(view_begin), view_end_(view_end), count_(count), delimiter_(delimiter) {}
+
+    static basic_group_view empty_view(const_msg_iterator end_it, int delimiter) noexcept {
+        return basic_group_view(end_it, end_it, 0, delimiter);
+    }
+
+    const_msg_iterator view_begin_;
+    const_msg_iterator view_end_;
+    std::size_t count_;
+    int delimiter_;
+};
+
+inline basic_group_view basic_message_reader::group(int count_tag, int first_tag_in_group) const {
+    auto it = begin();
+    if (!hffix::find_with_hint(begin(), end(), tag_equal(count_tag), it)) {
+        return basic_group_view::empty_view(end(), first_tag_in_group);
+    }
+    std::size_t count;
+    if (!it->value().try_as_int<std::size_t>(count)) {
+        return basic_group_view::empty_view(end(), first_tag_in_group);
+    }
+    ++it;
+    return basic_group_view(it, end(), count, first_tag_in_group);
+}
+
+inline basic_group_view basic_group_entry::group(int count_tag, int first_tag_in_group) const {
+    auto it = begin_;
+    if (!hffix::find_with_hint(begin_, end_, tag_equal(count_tag), it)) {
+        return basic_group_view::empty_view(end_, first_tag_in_group);
+    }
+    std::size_t count;
+    if (!it->value().try_as_int<std::size_t>(count)) {
+        return basic_group_view::empty_view(end_, first_tag_in_group);
+    }
+    ++it;
+    return basic_group_view(it, end_, count, first_tag_in_group);
+}
+
+template <int CountTag>
+inline basic_group_view basic_message_reader::group() const {
+    static_assert(groups::group_def<CountTag>::first_tag != 0,
+                  "Unknown CountTag for compile-time group dispatch. "
+                  "Register with HFFIX_REGISTER_GROUP(NoXxx, FirstTag) "
+                  "at namespace scope, or use the runtime overload "
+                  "group(count_tag, first_tag_in_group).");
+    return this->group(CountTag, groups::group_def<CountTag>::first_tag);
+}
+
+template <int CountTag>
+inline basic_group_view basic_group_entry::group() const {
+    static_assert(groups::group_def<CountTag>::first_tag != 0,
+                  "Unknown CountTag for compile-time group dispatch. "
+                  "Register with HFFIX_REGISTER_GROUP(NoXxx, FirstTag) "
+                  "at namespace scope, or use the runtime overload "
+                  "group(count_tag, first_tag_in_group).");
+    return this->group(CountTag, groups::group_def<CountTag>::first_tag);
+}
+
+using group_entry = basic_group_entry;
+using group_iterator = basic_group_iterator;
+using group_view = basic_group_view;
+
+/** @cond EXCLUDE */
 namespace details {
 bool is_tag_a_data_length(int tag);
 }
-/*! @endcond */
 
+/** @endcond */
 
-inline void message_reader_const_iterator::increment()
-{
-    buffer_ = current_.value_.end_ + 1;
-    current_.value_.begin_ = buffer_;
-    current_.tag_ = 0;
+HFFIX_ALWAYS_INLINE void basic_message_reader_const_iterator::increment() {
+    // Mirror basic_message_reader::end_ so `it != r.end()` terminates.
+    auto const set_at_end = [this]() noexcept {
+        buffer_ = message_end_ - 7;
+        current_.tag_ = 10;
+        current_.value_.begin_ = message_end_ - 4;
+        current_.value_.end_ = message_end_ - 1;
+    };
 
-    while(*current_.value_.begin_ != '=' && *current_.value_.begin_ != '\x01') {
-        current_.tag_ *= 10;
-        current_.tag_ += (*current_.value_.begin_ - '0');
-        ++current_.value_.begin_;
+    char const* p = current_.value_.end_ + 1;
+    buffer_ = p;
+
+    unsigned utag = 0;
+    while (p < message_end_ && *p != '=' && *p != '\x01') {
+        utag = utag * 10u + static_cast<unsigned>(*p - '0');
+        ++p;
     }
-
-    // we expect to see a '='. if we see a '\x01' at this point then this field
-    // has no value and the message is invalid, so we're doomed. it's too
-    // late to set is_invalid, though, so let's just say that this field
-    // has a null value.
-    if (*current_.value_.begin_ == '\x01') {
-        current_.value_.end_ = current_.value_.begin_;
+    int tag = static_cast<int>(utag);
+    if (p >= message_end_) [[unlikely]] {
+        set_at_end();
         return;
     }
 
-    // move past the '='.
-    ++current_.value_.begin_;
+    if (*p == '\x01') [[unlikely]] {
+        current_.tag_ = tag;
+        current_.value_.begin_ = p;
+        current_.value_.end_ = p;
+        return;
+    }
 
-    // find the end of the field value
-    current_.value_.end_ = std::find(current_.value_.begin_, message_reader_->message_end(), '\x01');
-    if (details::is_tag_a_data_length(current_.tag_)) {
-        size_t data_len = details::atou<size_t>(current_.value_.begin_, current_.value_.end_);
+    ++p;
+    char const* value_begin = p;
+    char const* value_end = ::hffix::details::find_soh(p, message_end_);
 
-        buffer_ = current_.value_.end_ + 1;
-        current_.value_.begin_ = buffer_;
-        current_.tag_ = 0;
+    if (details::is_tag_a_data_length(tag)) [[unlikely]] {
+        std::size_t data_len = details::atou<std::size_t>(value_begin, value_end);
 
-        while(*current_.value_.begin_ != '=') {
-            current_.tag_ *= 10;
-            current_.tag_ += (*current_.value_.begin_ - '0');
-            ++current_.value_.begin_;
+        p = value_end + 1;
+        buffer_ = p;
+        unsigned unext_tag = 0;
+        while (p < message_end_ && *p != '=') {
+            unext_tag = unext_tag * 10u + static_cast<unsigned>(*p - '0');
+            ++p;
+        }
+        int next_tag = static_cast<int>(unext_tag);
+        if (p >= message_end_) [[unlikely]] {
+            set_at_end();
+            return;
+        }
+        ++p;
+        if (data_len > static_cast<std::size_t>(message_end_ - p)) [[unlikely]] {
+            set_at_end();
+            return;
         }
 
-        current_.value_.end_ = ++current_.value_.begin_ + data_len;
+        current_.tag_ = next_tag;
+        current_.value_.begin_ = p;
+        current_.value_.end_ = p + data_len;
+        return;
     }
+
+    current_.tag_ = tag;
+    current_.value_.begin_ = value_begin;
+    current_.value_.end_ = value_end;
 }
 
 /* @cond EXCLUDE */
 
 namespace details {
 
+struct length_tag_index {
+    static constexpr int kBitmapSize = 1024;
+    std::uint64_t bitmap[kBitmapSize / 64]{};
+    int const* overflow_begin{};
+    int const* overflow_end{};
 
-// A predicate constructed with an int which returns true if the int passed to
-// the predicate is greater than or equal to the int passed to the constructor.
-struct int_gte {
-    int_gte(int tag) : tag(tag) {}
-    int tag;
-    bool operator()(int that) const {
-        return that >= tag;
+    constexpr length_tag_index() {
+        constexpr auto n = sizeof(length_fields) / sizeof(length_fields[0]);
+        static_assert(
+            std::is_sorted(std::begin(length_fields), std::end(length_fields)),
+            "length_fields must be sorted ascending; bitmap/binary-search split depends on it.");
+        std::size_t split = 0;
+        while (split < n && length_fields[split] < kBitmapSize)
+            ++split;
+        for (std::size_t i = 0; i < split; ++i) {
+            int const t = length_fields[i];
+            bitmap[t / 64] |= std::uint64_t(1) << (t % 64);
+        }
+        overflow_begin = length_fields + split;
+        overflow_end = length_fields + n;
+    }
+
+    HFFIX_ALWAYS_INLINE constexpr bool contains(int tag) const {
+        if (tag >= 0 && tag < kBitmapSize) [[likely]] {
+            return (bitmap[tag / 64] >> (tag % 64)) & 1u;
+        }
+        return std::binary_search(overflow_begin, overflow_end, tag);
     }
 };
 
-// Returns true if the argument exists in the length_fields array.
-//
-// We have to call this function every time a message_reader iterator
-// is incremented, so we want it to be fast.
-//
-// Instead of doing std::binary_search on the sorted range of length_fields,
-// we'll take advantage of an assumption that most tags are low-numbered
-// tags, and search from the beginning of length_fields, hoping that
-// our search will usually end quickly.
-//
-// TODO: This has not yet been benchmarked against any alternatives.
-// The benchmark results would depend on the distrubution of tags
-// in the FIX data set.
-inline bool is_tag_a_data_length(int tag)
-{
-    int* length_fields_end = length_fields + (sizeof(length_fields)/sizeof(length_fields[0]));
-    int* i = std::find_if(length_fields, length_fields_end, int_gte(tag));
-    if (i == length_fields_end) return false;
-    return (*i == tag);
+inline constinit length_tag_index const g_length_tag_table{};
+
+HFFIX_ALWAYS_INLINE bool is_tag_a_data_length(int tag) {
+    return g_length_tag_table.contains(tag);
 }
 
-// \brief std::ostream-able type returned by hffix::field_name function.
-template <typename AssociativeContainer> struct field_name_streamer {
+template <typename AssociativeContainer>
+struct field_name_streamer {
     int tag;
     AssociativeContainer const& field_dictionary;
     bool number_alternative;
 
-    field_name_streamer(int tag, AssociativeContainer const& field_dictionary, bool number_alternative) : tag(tag), field_dictionary(field_dictionary), number_alternative(number_alternative) {}
+    field_name_streamer(int tag, AssociativeContainer const& field_dictionary, bool number_alternative)
+        : tag(tag), field_dictionary(field_dictionary), number_alternative(number_alternative) {}
 
     friend std::ostream& operator<<(std::ostream& os, field_name_streamer that) {
         typename AssociativeContainer::const_iterator i = that.field_dictionary.find(that.tag);
@@ -2951,16 +2444,17 @@ template <typename AssociativeContainer> struct field_name_streamer {
     }
 };
 
-}
+}  // namespace details
+
 /* @endcond */
 
-/*!
+/**
   * \brief Given a field tag number and a field name dictionary, returns a type which provides `operator<<`  to write the name of the field to an `std::ostream`.
   * \tparam AssociativeContainer The type of the field name dictionary. Must satisfy concept `AssociativeContainer<int, std::string>`, for example `std::map<int, std::string>` or `std::unordered_map<int, std::string>`. See https://en.cppreference.com/w/cpp/named_req/AssociativeContainer
   *
   * \param tag The field number.
   * \param field_dictionary The field dictionary.
-  * \param or_number Specifies behavior if the tag is not found in the dictionary. If true, then the string representation of the flag will be written to the std::ostream. If false, then nothing will be written to the std::ostream. Default is false.
+  * \param or_number If true, prints the tag number when the dictionary has no mapping; if false, prints nothing. Default true.
   *
   * Example usage:
   * \code
@@ -2971,11 +2465,325 @@ template <typename AssociativeContainer> struct field_name_streamer {
   * std::cout << hffix::field_name(1000000, dictionary, false) << '\n';           // Unknown field tag, will print "\n".
   * \endcode
 */
-template <typename AssociativeContainer> details::field_name_streamer<AssociativeContainer> field_name(int tag, AssociativeContainer const& field_dictionary, bool or_number = true)
-{
+template <typename AssociativeContainer>
+details::field_name_streamer<AssociativeContainer> field_name(
+    int tag, AssociativeContainer const& field_dictionary, bool or_number = true) {
     return details::field_name_streamer<AssociativeContainer>(tag, field_dictionary, or_number);
 }
 
-} // namespace hffix
+/**
+ * \brief Random-access view of a parsed FIX message, built by
+ * `build_field_index` into a caller-supplied `field_index_buffer<N>`.
+ *
+ * Parallel insertion-order arrays: `tags[i]` and packed
+ * `pos_len[i] = (uint32_t pos << 32) | uint32_t len`, offsets relative
+ * to `message_begin()`. A non-`authoritative()` index can miss fields
+ * past slot `N` or skip indexing entirely when the message exceeds
+ * `kMaxIndexableMessageBytes`.
+ */
+class basic_indexed_message {
+public:
+    static constexpr std::size_t kMaxIndexableMessageBytes =
+        std::numeric_limits<std::uint32_t>::max();
 
-#endif
+    basic_indexed_message() = default;
+    basic_indexed_message(basic_indexed_message const&) = default;
+    basic_indexed_message& operator=(basic_indexed_message const&) = default;
+
+    char const* message_begin() const { return msg_begin_; }
+
+    [[nodiscard]] std::size_t field_count() const { return tags_.size(); }
+
+    [[nodiscard]] bool truncated() const { return truncated_; }
+
+    [[nodiscard]] bool overflowed() const { return overflowed_; }
+
+    /**
+     * `!truncated() && !overflowed()`. When false, `find_with_hint()` may report
+     * absence for a field that exists past the index.
+     */
+    [[nodiscard]] bool authoritative() const { return !truncated_ && !overflowed_; }
+
+    int tag_at(std::size_t i) const { return tags_[i]; }
+
+    field_value value_at(std::size_t i) const {
+        std::uint64_t const pl = pos_len_[i];
+        field_value v;
+        v.begin_ = msg_begin_ + (pl >> 32);
+        v.end_ = v.begin_ + static_cast<std::uint32_t>(pl);
+        return v;
+    }
+
+    /**
+     * \brief Find a field by tag using a position hint.
+     *
+     * Scans `[hint, field_count())` then wraps to `[0, hint)`. On hit,
+     * `hint` is set to the found index; on miss, unmodified.
+     *
+     * `hint == 0` returns the first occurrence. `hint > 0` returns the
+     * nearest occurrence at-or-after `hint`, not the first one — when
+     * the tag appears multiple times (e.g. across repeating-group
+     * entries) the result depends on `hint`. Pass `hint = 0` for
+     * first-occurrence semantics; use `has(tag)` for presence-only.
+     *
+     * \param tag Field tag to find.
+     * \param hint In: scan start. Out: found index on hit; unmodified on miss.
+     * \return Field value, or default-constructed `field_value` if not found.
+     */
+    inline field_value find_with_hint(int tag, std::size_t& hint) const {
+        std::size_t const n = tags_.size();
+        if (hint > n)
+            hint = 0;
+        std::size_t const suffix_n = n - hint;
+        std::size_t const i = ::hffix::details::find_tag_in_index(tags_.data() + hint, suffix_n, tag);
+        if (i != suffix_n) {
+            hint += i;
+            return value_at(hint);
+        }
+        std::size_t const j = ::hffix::details::find_tag_in_index(tags_.data(), hint, tag);
+        if (j != hint) {
+            hint = j;
+            return value_at(hint);
+        }
+        return {};
+    }
+
+    [[nodiscard]] bool has(int tag) const {
+        return ::hffix::details::find_tag_in_index(tags_.data(), tags_.size(), tag) != tags_.size();
+    }
+
+private:
+    template <std::size_t N>
+    friend basic_indexed_message build_field_index(basic_message_reader const&,
+                                                   field_index_buffer<N>&);
+    template <std::size_t N>
+    friend basic_indexed_message build_field_index(basic_group_entry const&, field_index_buffer<N>&);
+
+    char const* msg_begin_ = nullptr;
+    std::span<int const> tags_;
+    std::span<std::uint64_t const> pos_len_;
+    bool truncated_ = false;
+    bool overflowed_ = false;
+};
+
+using indexed_message = basic_indexed_message;
+
+template <std::size_t N>
+basic_indexed_message build_field_index(basic_message_reader const& r,
+                                        field_index_buffer<N>& idx_buffer) {
+    basic_indexed_message out;
+    if (!r.is_valid())
+        return out;
+    out.msg_begin_ = r.message_begin();
+
+    std::size_t const msg_size = r.message_size();
+    if (msg_size > basic_indexed_message::kMaxIndexableMessageBytes) [[unlikely]] {
+        out.overflowed_ = true;
+        return out;
+    }
+
+    std::size_t count = 0;
+    auto it = r.begin();
+    auto end = r.end();
+    for (; it != end && count < N; ++it) {
+        auto const& v = it->value();
+        std::ptrdiff_t const pos = v.begin() - out.msg_begin_;
+        std::ptrdiff_t const len = v.end() - v.begin();
+        idx_buffer.tags[count] = it->tag();
+        idx_buffer.pos_len[count] = (static_cast<std::uint64_t>(pos) << 32) |
+                                    static_cast<std::uint64_t>(static_cast<std::uint32_t>(len));
+        ++count;
+    }
+    out.truncated_ = (it != end);
+    out.tags_ = std::span<int const>(idx_buffer.tags, count);
+    out.pos_len_ = std::span<std::uint64_t const>(idx_buffer.pos_len, count);
+    return out;
+}
+
+/** Group-entry overload. Offsets are packed against the entry's first byte. */
+template <std::size_t N>
+basic_indexed_message build_field_index(basic_group_entry const& entry,
+                                        field_index_buffer<N>& idx_buffer) {
+    basic_indexed_message out;
+    auto it = entry.begin();
+    auto end = entry.end();
+    if (it == end)
+        return out;
+    out.msg_begin_ = it.buffer_begin();
+
+    constexpr std::uint64_t kMax32 = std::numeric_limits<std::uint32_t>::max();
+    std::size_t count = 0;
+    for (; it != end && count < N; ++it) {
+        auto const& v = it->value();
+        std::ptrdiff_t const pos = v.begin() - out.msg_begin_;
+        std::ptrdiff_t const len = v.end() - v.begin();
+        if (pos < 0 || static_cast<std::uint64_t>(pos) > kMax32 || len < 0 ||
+            static_cast<std::uint64_t>(len) > kMax32) [[unlikely]] {
+            out.overflowed_ = true;
+            return out;
+        }
+        idx_buffer.tags[count] = it->tag();
+        idx_buffer.pos_len[count] = (static_cast<std::uint64_t>(pos) << 32) |
+                                    static_cast<std::uint64_t>(static_cast<std::uint32_t>(len));
+        ++count;
+    }
+    out.truncated_ = (it != end);
+    out.tags_ = std::span<int const>(idx_buffer.tags, count);
+    out.pos_len_ = std::span<std::uint64_t const>(idx_buffer.pos_len, count);
+    return out;
+}
+
+using message_reader = basic_message_reader;
+using message_reader_const_iterator = basic_message_reader_const_iterator;
+
+/**
+ * \brief Range over consecutive FIX messages packed into a single buffer.
+ *
+ * Iterates contiguous messages produced by typical FIX wire delivery
+ * (e.g. one `recv()` returning N concatenated frames). Yields only
+ * `is_complete() && is_valid()` readers. Invalid frames between valid
+ * ones are skipped via `next_message_reader()` resync. Iteration stops
+ * at the first incomplete frame; the position of that frame is
+ * available from `iterator::remainder()` for callers that buffer the
+ * tail across reads.
+ *
+ * Thread-safety: the range itself holds two pointers and is trivially
+ * copyable. Iterators hold a `basic_message_reader` by value and are
+ * independent across copies.
+ */
+class basic_message_range {
+public:
+    using value_type = basic_message_reader;
+
+    explicit basic_message_range(std::span<char const> buf) noexcept
+        : begin_(buf.data()), end_(buf.data() + buf.size()) {}
+
+    basic_message_range(char const* begin, char const* end) noexcept : begin_(begin), end_(end) {}
+
+    basic_message_range(char const* buf, std::size_t n) noexcept : begin_(buf), end_(buf + n) {}
+
+    class iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = basic_message_reader;
+        using reference = basic_message_reader const&;
+        using pointer = basic_message_reader const*;
+        using difference_type = std::ptrdiff_t;
+
+        iterator(char const* b, char const* e) noexcept : r_(b, e) { skip_invalid(); }
+
+        reference operator*() const noexcept { return r_; }
+
+        pointer operator->() const noexcept { return &r_; }
+
+        iterator& operator++() noexcept {
+            HFFIX_ASSERT(r_.is_complete(), "basic_message_range::iterator: ++ past end of range.");
+            r_ = r_.next_message_reader();
+            skip_invalid();
+            return *this;
+        }
+
+        iterator operator++(int) noexcept {
+            iterator tmp = *this;
+            ++(*this);
+            return tmp;
+        }
+
+        friend bool operator==(iterator const& a, iterator const& b) noexcept {
+            bool const a_end = !a.r_.is_complete();
+            bool const b_end = !b.r_.is_complete();
+            if (a_end && b_end)
+                return true;
+            if (a_end != b_end)
+                return false;
+            return a.r_.buffer_begin() == b.r_.buffer_begin();
+        }
+
+        friend bool operator!=(iterator const& a, iterator const& b) noexcept { return !(a == b); }
+
+        /**
+         * \brief Buffer position where iteration stopped.
+         *
+         * On the past-the-end iterator (`rng.end()` or one advanced
+         * past the final complete frame), this points at the first
+         * byte of the unconsumed tail (an incomplete frame, or the
+         * buffer end). Callers using stream re-feeding copy
+         * `[remainder(), buffer_end)` into the next read buffer.
+         */
+        char const* remainder() const noexcept { return r_.buffer_begin(); }
+
+    private:
+        void skip_invalid() noexcept {
+            while (r_.is_complete() && !r_.is_valid()) {
+                r_ = r_.next_message_reader();
+            }
+        }
+
+        basic_message_reader r_;
+    };
+
+    iterator begin() const noexcept { return iterator(begin_, end_); }
+
+    iterator end() const noexcept { return iterator(end_, end_); }
+
+private:
+    char const* begin_;
+    char const* end_;
+};
+
+using message_range = basic_message_range;
+
+/**
+ * \brief Construct a range over consecutive FIX messages in `buf`.
+ */
+inline basic_message_range messages(std::span<char const> buf) noexcept {
+    return basic_message_range(buf);
+}
+
+inline basic_message_range messages(char const* begin, char const* end) noexcept {
+    return basic_message_range(begin, end);
+}
+
+inline basic_message_range messages(char const* buf, std::size_t n) noexcept {
+    return basic_message_range(buf, n);
+}
+
+/**
+ * \brief Callback-style batched parse. Invokes `fn` once per complete,
+ * valid FIX message in `buf`.
+ *
+ * Equivalent to a loop over `messages(buf)` but threads the
+ * tail-position return through the call, which is the common shape in
+ * a feed-handler dispatch loop. Invalid frames are skipped via
+ * resync; iteration stops at the first incomplete frame.
+ *
+ * \param buf Span over the byte range to scan.
+ * \param fn Callable invoked as `fn(basic_message_reader const&)`
+ *   for each yielded message.
+ * \return Pointer to the first byte of the unconsumed tail. Equals
+ *   `buf.data() + buf.size()` when the buffer drained cleanly,
+ *   otherwise points at an incomplete frame the caller should keep
+ *   for the next read.
+ */
+template <class Fn>
+HFFIX_HOT char const* for_each_message(std::span<char const> buf, Fn&& fn) {
+    basic_message_reader r(buf);
+    while (r.is_complete()) {
+        if (r.is_valid()) {
+            HFFIX_PREFETCH(r.message_end());
+            fn(static_cast<basic_message_reader const&>(r));
+        }
+        r = r.next_message_reader();
+    }
+    return r.buffer_begin();
+}
+
+template <class Fn>
+HFFIX_HOT char const* for_each_message(char const* begin, char const* end, Fn&& fn) {
+    return for_each_message(std::span<char const>(begin, static_cast<std::size_t>(end - begin)),
+                            std::forward<Fn>(fn));
+}
+
+}  // namespace hffix
+
+#include <hffix_groups.hpp>

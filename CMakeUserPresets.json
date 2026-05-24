@@ -1,0 +1,11 @@
+{
+    "version": 4,
+    "vendor": {
+        "conan": {}
+    },
+    "include": [
+        "build/CMakePresets.json",
+        "build-asan/CMakePresets.json",
+        "compare2upstream/build/conan-base/CMakePresets.json"
+    ]
+}
